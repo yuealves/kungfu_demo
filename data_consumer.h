@@ -71,7 +71,7 @@ public:
     std::string tick_channel = "insight_stock_tick_data";
     std::string order_channel = "insight_stock_order_data";
     std::string trade_channel = "insight_stock_trade_data";
-    std::string path = "/shared/kungfu/journal/user/";
+    std::string path = "/home/linwei/Code/quant/stream_feature/insight_demo/insight_demo/deps/data/";
     std::vector<std::pair<std::string, std::string>> journal_pair = {{path, tick_channel}, {path, order_channel},  { path, trade_channel}};
 };
 

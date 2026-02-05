@@ -4,10 +4,127 @@
 #include <iostream>
 #include <sstream>
 #include <math.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <algorithm>
+#include <cstring>
+
+// 本地定义 Journal 文件格式结构（避免头文件 byte 类型冲突）
+#define JOURNAL_SHORT_NAME_MAX_LENGTH 30
+#define JOURNAL_FRAME_STATUS_WRITTEN 1
+
+struct LocalPageHeader {
+    unsigned char status;
+    char journal_name[JOURNAL_SHORT_NAME_MAX_LENGTH];
+    short page_num;
+    long start_nano;
+    long close_nano;
+    int frame_num;
+    int last_pos;
+    short frame_version;
+    short reserve_short[3];
+    long reserve_long[9];
+} __attribute__((packed));
+
+struct LocalFrameHeader {
+    volatile unsigned char status;
+    short source;
+    long nano;
+    int length;
+    unsigned int hash;
+    short msg_type;
+    unsigned char last_flag;
+    int req_id;
+    long extra_nano;
+    int err_id;
+} __attribute__((packed));
 
 YJJ_NAMESPACE_START
 
-DataConsumer::DataConsumer(): start_nano(-1), end_nano(-1), cur_time(-1), is_running(true)
+// 简单的本地 Journal 页面读取器
+class LocalJournalPage {
+public:
+    void* buffer;
+    int size;
+    int current_pos;
+
+    LocalJournalPage() : buffer(nullptr), size(0), current_pos(0) {}
+
+    ~LocalJournalPage() {
+        if (buffer) {
+            munmap(buffer, size);
+        }
+    }
+
+    bool load(const std::string& filepath) {
+        int fd = open(filepath.c_str(), O_RDONLY);
+        if (fd < 0) {
+            std::cerr << "Cannot open file: " << filepath << std::endl;
+            return false;
+        }
+
+        struct stat st;
+        fstat(fd, &st);
+        size = st.st_size;
+
+        buffer = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+        close(fd);
+
+        if (buffer == MAP_FAILED) {
+            buffer = nullptr;
+            return false;
+        }
+
+        // 跳过 PageHeader
+        current_pos = sizeof(LocalPageHeader);
+        return true;
+    }
+
+    LocalFrameHeader* nextFrame() {
+        if (!buffer || current_pos >= size) return nullptr;
+
+        LocalFrameHeader* header = (LocalFrameHeader*)((char*)buffer + current_pos);
+
+        // 检查 frame 是否有效
+        if (header->status != JOURNAL_FRAME_STATUS_WRITTEN) {
+            return nullptr;
+        }
+
+        // 移动到下一个 frame
+        current_pos += header->length;
+        return header;
+    }
+
+    void* getFrameData(LocalFrameHeader* header) {
+        return (void*)((char*)header + sizeof(LocalFrameHeader));
+    }
+};
+
+// 获取目录下所有匹配的 journal 文件
+std::vector<std::string> getJournalFiles(const std::string& dir, const std::string& jname) {
+    std::vector<std::string> files;
+    DIR* d = opendir(dir.c_str());
+    if (!d) return files;
+
+    std::string pattern = "yjj." + jname + ".";
+    struct dirent* entry;
+    while ((entry = readdir(d)) != nullptr) {
+        std::string filename = entry->d_name;
+        if (filename.find(pattern) == 0 && filename.find(".journal") != std::string::npos) {
+            files.push_back(dir + filename);
+        }
+    }
+    closedir(d);
+
+    // 按文件名排序（按页号）
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+DataConsumer::DataConsumer(): start_nano(-1), end_nano(-1), reader(nullptr), cur_time(-1), is_running(true)
 {
     std::cout << "start!" << std::endl;
 }
@@ -16,49 +133,55 @@ void DataConsumer::init(long start_nano, long end_nano)
 {
     this->start_nano = start_nano;
     this->end_nano = end_nano;
-    std::string reader_name = "Consumer_" + parseNano(getNanoTime(), "%H%M%S");
-    vector<std::string> empty;
-    reader = JournalReader::createReaderWithSys(empty, empty, start_nano, reader_name);
     cur_time = start_nano;
-    for(const auto& writer_pair: journal_pair){
-        int idx = reader->addJournal(writer_pair.first, writer_pair.second);
-        reader->seekTimeJournal(idx, cur_time);
-    }
-
+    // 不再使用 JournalReader，改用本地文件直接读取
 }
 
 void DataConsumer::run()
 {
-    FramePtr frame;
+    // 使用本地文件读取方式
+    for (const auto& writer_pair : journal_pair) {
+        std::string dir = writer_pair.first;
+        std::string jname = writer_pair.second;
 
-    while (is_running)
-    {
-        {
-            frame = reader->getNextFrame();
-            if (frame.get() != nullptr)
-            {
-                void* data = frame->getData();
-                short msg_type = frame->getMsgType();
-                cur_time = frame->getNano();
-                if(msg_type == MSG_TYPE_L2_TICK){
-                    KyStdSnpType *md = (KyStdSnpType*)data;
+        std::vector<std::string> files = getJournalFiles(dir, jname);
+        std::cout << "Found " << files.size() << " journal files for " << jname << std::endl;
+
+        for (const auto& filepath : files) {
+            std::cout << "Processing: " << filepath << std::endl;
+
+            LocalJournalPage page;
+            if (!page.load(filepath)) {
+                std::cerr << "Failed to load: " << filepath << std::endl;
+                continue;
+            }
+
+            LocalFrameHeader* header;
+            while ((header = page.nextFrame()) != nullptr) {
+                void* data = page.getFrameData(header);
+                short msg_type = header->msg_type;
+                cur_time = header->nano;
+
+                if (msg_type == MSG_TYPE_L2_TICK) {
+                    KyStdSnpType* md = (KyStdSnpType*)data;
                     on_market_data(md);
                 }
-                else if(msg_type == MSG_TYPE_L2_ORDER){
+                else if (msg_type == MSG_TYPE_L2_ORDER) {
                     KyStdOrderType* md = (KyStdOrderType*)data;
                     on_order_data(md);
                 }
-                else if(msg_type == MSG_TYPE_L2_TRADE){
+                else if (msg_type == MSG_TYPE_L2_TRADE) {
                     KyStdTradeType* md = (KyStdTradeType*)data;
                     on_trade_data(md);
                 }
-                else{
-                    std::cout << "can't recognize type: " << msg_type << std::endl;
-                }
             }
-
         }
     }
+
+    std::cout << "\n=== Summary ===" << std::endl;
+    std::cout << "Total tick data: " << tick_offset << std::endl;
+    std::cout << "Total order data: " << order_offset << std::endl;
+    std::cout << "Total trade data: " << trade_offset << std::endl;
 }
 
 std::vector<L2StockTickDataField> DataFetcher::get_tick_data(long start_nano, long end_nano)
