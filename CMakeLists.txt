@@ -4,12 +4,11 @@ set (CMAKE_BUILE_TYPE BUILD)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ============ 本地依赖路径配置 ============
-# 依赖文件放在项目下的 deps/ 目录
-SET(DEPS_DIR "${PROJECT_SOURCE_DIR}/deps")
-SET(KUNGFU_INCLUDE_DIR "${DEPS_DIR}/kungfu_include")
-SET(KUNGFU_LIB_DIR "${DEPS_DIR}/kungfu_yijinjing_lib")
-SET(BOOST_ROOT "${DEPS_DIR}/boost-1.62.0")
+# ============ Docker 环境依赖路径配置 ============
+SET(TOOLCHAIN_DIR "/opt/kungfu/toolchain")
+SET(KUNGFU_INCLUDE_DIR "/opt/kungfu/master/include")
+SET(KUNGFU_LIB_DIR "/opt/kungfu/master/lib/yijinjing")
+SET(BOOST_ROOT "${TOOLCHAIN_DIR}/boost-1.62.0")
 
 SET(BOOST_INCLUDEDIR "${BOOST_ROOT}/include")
 SET(BOOST_LIBRARYDIR "${BOOST_ROOT}/lib")
@@ -17,7 +16,7 @@ SET(BOOST_LIBRARYDIR "${BOOST_ROOT}/lib")
 SET(Boost_USE_MULTITHREADED ON)
 SET(Boost_USE_STATIC_LIBS OFF)
 SET(Boost_USE_STATIC_RUNTIME OFF)
-SET(Boost_NO_SYSTEM_PATHS ON)
+# SET(Boost_NO_SYSTEM_PATHS ON)
 
 include_directories("/usr/local/include/")
 
@@ -41,11 +40,14 @@ SET(Boost_LIBRARIES
 )
 INCLUDE_DIRECTORIES(${BOOST_INCLUDEDIR})
 
-# Python 2.7 配置 (使用 conda 环境)
-SET(PYTHON_INCLUDE_DIR "/home/linwei/miniconda3/envs/py27/include/python2.7")
-SET(PYTHON_LIBRARY "/home/linwei/miniconda3/envs/py27/lib")
-INCLUDE_DIRECTORIES(${PYTHON_INCLUDE_DIR})
-LINK_DIRECTORIES(${PYTHON_LIBRARY})
+# Python 2.7 配置
+FIND_PACKAGE(PythonInterp 2)
+FIND_PACKAGE(PythonLibs 2)
+INCLUDE_DIRECTORIES(${PYTHON_INCLUDE_PATH})
+link_directories(${PYTHON_LIBRARIES})
+
+# 将项目根路径注入编译宏，代码中可用 PROJECT_ROOT_DIR 拼接相对路径
+add_definitions(-DPROJECT_ROOT_DIR="${PROJECT_SOURCE_DIR}")
 
 SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -O3 -Wall -fPIC")
 
