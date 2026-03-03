@@ -49,7 +49,7 @@ link_directories(${PYTHON_LIBRARIES})
 # 将项目根路径注入编译宏，代码中可用 PROJECT_ROOT_DIR 拼接相对路径
 add_definitions(-DPROJECT_ROOT_DIR="${PROJECT_SOURCE_DIR}")
 
-SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -O3 -Wall -fPIC")
+SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -Wall -fPIC")
 
 # Kungfu 头文件
 INCLUDE_DIRECTORIES(${KUNGFU_INCLUDE_DIR})
