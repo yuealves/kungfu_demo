@@ -1,10 +1,40 @@
-# Journal 数据读取详解
+# Journal 数据写入与读取详解
 
-本文档说明如何从 KungFu yijinjing journal 系统中读取 L2 行情数据，包括 Tick 快照、逐笔委托和逐笔成交数据。
+本文档说明 KungFu yijinjing journal 系统中 L2 行情数据的写入和读取机制。
+
+## 0. 写入与读取的协作原理
+
+Journal 文件通过 mmap 映射到内存，writer 和 reader 进程映射同一个文件，共享同一块物理内存。数据的写入和新数据发现完全通过这块共享内存完成，不依赖任何 IPC 通知机制。
+
+### 写入过程
+
+实盘中，`insight_gateway` 通过 `JournalWriter::write_frame()` 写入数据。每次写入在 mmap 内存上执行以下操作：
+
+1. **定位空闲帧**：`Page::locateWritableFrame()` 从当前位置向后扫描，跳过 `status==WRITTEN` 的已写帧，找到第一个 `status==RAW`（值为 0）的位置。
+2. **填写帧头 + 拷贝数据**：在该位置写入 40 字节 FrameHeader（时间戳、msg_type、长度等），然后 `memcpy` 将 packed 结构体（如 `KyStdSnpType`）复制到帧头之后。
+3. **标记完成**：`Frame::setStatusWritten()` 先将**下一帧**的 status 设为 RAW（边界哨兵，防止 reader 越界读取），再将**当前帧**的 status 从 RAW 改为 WRITTEN（值为 1）。
+
+当页面剩余空间不足 2MB 时，writer 向 Paged 申请下一个 128MB 页面。
+
+### reader 如何发现新数据
+
+**没有显式通知。** reader 轮询 mmap 共享内存中帧头的 `status` 字段：
+
+- `status == WRITTEN (1)` → 这一帧有数据，可以读取
+- `status == RAW (0)` → 这一帧还没有被写入，暂无新数据
+- `status == PAGE_END (2)` → 当前页结束，加载下一页
+
+`status` 字段声明为 `volatile`，保证编译器不会缓存它的值，每次都从内存重新读取。因为 writer 和 reader 的 mmap 映射到同一块物理内存页，writer 写入 `status = WRITTEN` 后 reader 立即可见，无需 socket、管道或信号量。
+
+Paged 进程**不参与数据通知**，它只负责 mmap 映射管理和换页分配。
+
+### 为什么用 busy-wait：用 CPU 换延迟
+
+这种"while 循环不停检查 status"的做法是 busy-wait（忙等），没有新数据时线程会空转，CPU 占用率会飙到接近 100%（实盘 `insight_gateway` 就是 99% CPU）。这是低延迟系统的经典设计取舍：`sleep` 或 `epoll` 等休眠/通知机制的唤醒延迟在微秒级，而 busy-wait 轮询内存的延迟在纳秒级，对高频行情场景差了几个数量级。KungFu 框架不提供"有数据通知、无数据休眠"的模式，它就是为实盘托管机设计的——CPU 本来就是拿来干这个的。
 
 ## 1. 概述
 
-Journal 是 KungFu 框架的持久化存储组件，用于记录和回放行情数据。本模块提供两种读取方式：
+Journal 是 KungFu 框架的持久化存储组件，用于记录和回放行情数据。读取方式有两种：
 
 | 读取方式 | 用途 | 核心类 |
 |---------|------|--------|
@@ -296,7 +326,68 @@ get 200 tick data
 ...
 ```
 
-## 7. 注意事项
+## 7. 实盘 data_fetcher：定时读 journal 写 CSV/Parquet
+
+实盘托管机上运行着三个 `data_fetcher` 实例（源码位于 `market_gateway/src/brokers/insight_tcp/data_fetcher.h`），它们定时从 journal 读取数据并导出为 CSV 或 Parquet 文件。
+
+### 7.1 启动方式
+
+```bash
+./data_fetcher --tick-only  --interval 1 &   # 每 1 分钟 dump tick
+./data_fetcher --order-only --interval 1 &   # 每 1 分钟 dump order
+./data_fetcher --trade-only --interval 1 &   # 每 1 分钟 dump trade
+```
+
+`--interval 1` 表示 1 分钟为一个时间窗口。每个实例只处理一种数据类型，互不干扰。
+
+### 7.2 类继承关系
+
+```
+DataConsumer          — journal 读取 + msg_type 分发（createReaderWithSys）
+  └── DataFetcher     — 按时间段提取数据到 vector（get_tick_data 等）
+        └── DumpHandler — 定时调度 + 写 CSV/Parquet
+```
+
+### 7.3 定时 dump 流程
+
+`DumpHandler` 启动后，在独立线程中执行 `dump_to_file()`：
+
+1. **生成时间点序列**：根据 `interval`、`start_time`、`end_time` 生成目标时间列表。例如 interval=1 分钟时生成 `[09:26, 09:27, ..., 11:31, 13:00, ..., 15:01]`，自动跳过午休（11:31-12:59）。
+
+2. **等待到达目标时间**：对每个目标时间，`sleep_until` 等到该时刻。
+
+3. **读取该时间窗口的 journal 数据**：调用 `get_tick_data(start_nano, end_nano)` 等方法。内部创建 `JournalReader::create()`（LocalPageProvider，不需要 Paged），遍历该时间段内的所有帧，将 `KyStdSnpType` 通过 `trans_tick()` 转为 `L2StockTickDataField`，收集到 vector 中。对于 order 和 trade 数据，还会按 `decode_exchange()` 拆分为沪市/深市两个 vector。
+
+4. **写入文件**：根据配置写 CSV 或 Parquet：
+   - **CSV**：调用 L2 结构体的 `to_csv_header()` 写表头（仅第一次），`to_csv_row()` 逐行写入
+   - **Parquet**：调用 `ParquetUtils::write_tick_data_to_parquet()` 等，通过 Apache Arrow 构建列式数据后写入
+
+输出文件路径格式：`{dump_path}/{channel_name}/{date}_{HH:MM:00}.{csv|parquet}`
+
+### 7.4 设计缺陷
+
+这个 data_fetcher 的实现方式相当愚蠢——KungFu journal 系统本身就支持通过 mmap 共享内存 + volatile status 轮询来**实时发现新数据**（见 § 0），`JournalReader::createReaderWithSys()` 可以做到帧级别的实时流式读取。但 data_fetcher 完全没有利用这个能力，而是用 `sleep_until` 傻等到整分钟，再用 `JournalReader::create()`（LocalPageProvider）做一次离线批量提取。
+
+本质上就是把一个天然支持实时流的系统，硬生生用成了**每分钟跑一次的定时批处理任务**。延迟白白增加到分钟级，还要维护时间点序列生成、午休跳过等一堆不必要的调度逻辑。
+
+### 7.5 整体时序
+
+```
+09:10  insight_gateway 启动，开始写 journal
+09:20  3 个 data_fetcher 启动
+09:26  tick fetcher: 读 journal [09:10, 09:26]，写 tick csv/parquet
+09:26  order fetcher: 读 journal [09:10, 09:26]，拆分 SH/SZ，各写一个文件
+09:27  tick fetcher: 读 journal [09:26, 09:27]，追加写入
+09:27  order fetcher: 读 journal [09:26, 09:27]，追加写入
+...    每分钟重复
+11:31  上午收盘，dump 11:30-11:31 的数据
+13:00  下午开盘，跳过午休，继续 dump
+...
+15:01  收盘后最后一次 dump
+15:30  stopAtTime 触发，进程退出
+```
+
+## 8. 注意事项
 
 1. **数据目录**：默认路径为 `kungfu_demo/deps/data/`，可通过修改 `DataConsumer::path` (`data_consumer.h:74`) 变量更改
 2. **时间格式**：`parseTime()` 使用 `%Y%m%d-%H:%M:%S` 格式
