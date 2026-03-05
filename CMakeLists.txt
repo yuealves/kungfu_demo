@@ -79,6 +79,12 @@ ADD_EXECUTABLE(data_consumer data_consumer.cpp)
 
 TARGET_LINK_LIBRARIES(data_consumer insight_handle)
 
+ADD_EXECUTABLE(journal_replayer journal_replayer.cpp)
+TARGET_LINK_LIBRARIES(journal_replayer insight_handle)
+
+ADD_EXECUTABLE(live_reader live_reader.cpp)
+TARGET_LINK_LIBRARIES(live_reader insight_handle)
+
 
 
 
