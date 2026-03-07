@@ -7,9 +7,9 @@ set -e
 PAGED_PID_FILE="/shared/kungfu/pid/paged.pid"
 PAGED_SOCK="/shared/kungfu/socket/paged.sock"
 
-# 检查是否已在运行
-if [ -S "$PAGED_SOCK" ]; then
-    echo "[paged] already running (socket exists)"
+# 检查是否真正在运行（socket 存在 + 进程存活）
+if [ -S "$PAGED_SOCK" ] && [ -f "$PAGED_PID_FILE" ] && kill -0 "$(cat "$PAGED_PID_FILE")" 2>/dev/null; then
+    echo "[paged] already running (pid=$(cat "$PAGED_PID_FILE"))"
     echo "[paged] use scripts/stop_paged.sh to stop first"
     exit 0
 fi
