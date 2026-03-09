@@ -52,9 +52,17 @@ ARROW_CPP_DIR="${BUILD_DIR}/cpp"
 BUILD_OUT="${BUILD_DIR}/cpp/build"
 mkdir -p "${BUILD_OUT}"
 
-# [2] CMake 配置（完全离线：依赖用 file:// URL，Boost 用系统已有的）
+# [2] CMake 配置（完全离线：依赖用环境变量 file:// URL，Boost 用系统已有的）
 echo "[2/4] CMake 配置（离线模式）..."
 cd "${BUILD_OUT}"
+
+# Arrow 的 ThirdpartyToolchain.cmake 通过环境变量读取离线 URL（不是 CMake -D 变量）
+export ARROW_THRIFT_URL="file://${THIRD_PARTY}/thrift-0.22.0.tar.gz"
+export ARROW_SNAPPY_URL="file://${THIRD_PARTY}/snappy-1.2.2.tar.gz"
+export ARROW_ZLIB_URL="file://${THIRD_PARTY}/zlib-1.3.1.tar.gz"
+export ARROW_MIMALLOC_URL="file://${THIRD_PARTY}/mimalloc-2.2.4.tar.gz"
+export ARROW_RAPIDJSON_URL="file://${THIRD_PARTY}/rapidjson-232389d.tar.gz"
+export ARROW_XSIMD_URL="file://${THIRD_PARTY}/xsimd-13.0.0.tar.gz"
 
 cmake "${ARROW_CPP_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -76,13 +84,7 @@ cmake "${ARROW_CPP_DIR}" \
     -DARROW_BUILD_EXAMPLES=OFF \
     -DARROW_DEPENDENCY_SOURCE=BUNDLED \
     -DBoost_SOURCE=SYSTEM \
-    -DBOOST_ROOT="${BOOST_ROOT}" \
-    -DARROW_THRIFT_URL="file://${THIRD_PARTY}/thrift-0.22.0.tar.gz" \
-    -DARROW_SNAPPY_URL="file://${THIRD_PARTY}/snappy-1.2.2.tar.gz" \
-    -DARROW_ZLIB_URL="file://${THIRD_PARTY}/zlib-1.3.1.tar.gz" \
-    -DARROW_MIMALLOC_URL="file://${THIRD_PARTY}/mimalloc-2.2.4.tar.gz" \
-    -DARROW_RAPIDJSON_URL="file://${THIRD_PARTY}/rapidjson-232389d.tar.gz" \
-    -DARROW_XSIMD_URL="file://${THIRD_PARTY}/xsimd-13.0.0.tar.gz"
+    -DBOOST_ROOT="${BOOST_ROOT}"
 
 # [3] 编译
 echo "[3/4] 编译 (${NPROC} jobs)..."
