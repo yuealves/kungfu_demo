@@ -73,13 +73,12 @@ int main(int argc, char* argv[]) {
     }
     std::cout << std::endl;
 
-    // 收集所有记录
-    std::vector<TickRecord>  tick_records;
-    std::vector<OrderRecord> order_records;
-    std::vector<TradeRecord> trade_records;
+    std::string date = today_cst();
+    std::cout << "Date prefix: " << date << "\n" << std::endl;
 
-    // 处理 tick journal
+    // ---- Tick: 读完即写，写完释放 ----
     {
+        std::vector<TickRecord> records;
         auto files = getJournalFiles(input_dir, "insight_stock_tick_data");
         std::cout << "[tick] Found " << files.size() << " journal files" << std::endl;
         for (size_t fi = 0; fi < files.size(); ++fi) {
@@ -90,24 +89,28 @@ int main(int argc, char* argv[]) {
                 std::cout << " -- SKIP (load failed)" << std::endl;
                 continue;
             }
-
-            size_t count_before = tick_records.size();
+            size_t count_before = records.size();
             LocalFrameHeader* header;
             while ((header = page.nextFrame()) != nullptr) {
                 if (header->msg_type == MSG_TYPE_L2_TICK) {
                     auto* md = (KyStdSnpType*)page.getFrameData(header);
-                    tick_records.push_back(convert_tick(*md, header->nano));
+                    records.push_back(convert_tick(*md, header->nano));
                 }
             }
-            std::cout << " -> +" << (tick_records.size() - count_before)
-                      << " (total: " << tick_records.size() << ")" << std::endl;
+            std::cout << " -> +" << (records.size() - count_before)
+                      << " (total: " << records.size() << ")" << std::endl;
         }
-    }
+        std::cout << "[tick] Total: " << records.size() << " records" << std::endl;
+        if (!records.empty()) {
+            write_tick_parquet(records, output_dir + date + "_tick_data.parquet", max_rows_tick);
+        }
+    } // tick_records 在这里释放
 
-    // 处理 order journal
+    // ---- Order: 读完即写，写完释放 ----
     {
+        std::vector<OrderRecord> records;
         auto files = getJournalFiles(input_dir, "insight_stock_order_data");
-        std::cout << "[order] Found " << files.size() << " journal files" << std::endl;
+        std::cout << "\n[order] Found " << files.size() << " journal files" << std::endl;
         for (size_t fi = 0; fi < files.size(); ++fi) {
             const auto& filepath = files[fi];
             std::cout << "[order] (" << (fi + 1) << "/" << files.size() << ") " << filepath << std::flush;
@@ -116,24 +119,28 @@ int main(int argc, char* argv[]) {
                 std::cout << " -- SKIP (load failed)" << std::endl;
                 continue;
             }
-
-            size_t count_before = order_records.size();
+            size_t count_before = records.size();
             LocalFrameHeader* header;
             while ((header = page.nextFrame()) != nullptr) {
                 if (header->msg_type == MSG_TYPE_L2_ORDER) {
                     auto* md = (KyStdOrderType*)page.getFrameData(header);
-                    order_records.push_back(convert_order(*md, header->nano));
+                    records.push_back(convert_order(*md, header->nano));
                 }
             }
-            std::cout << " -> +" << (order_records.size() - count_before)
-                      << " (total: " << order_records.size() << ")" << std::endl;
+            std::cout << " -> +" << (records.size() - count_before)
+                      << " (total: " << records.size() << ")" << std::endl;
         }
-    }
+        std::cout << "[order] Total: " << records.size() << " records" << std::endl;
+        if (!records.empty()) {
+            write_order_parquet(records, output_dir + date + "_order_data.parquet", max_rows_order);
+        }
+    } // order_records 在这里释放
 
-    // 处理 trade journal
+    // ---- Trade: 读完即写，写完释放 ----
     {
+        std::vector<TradeRecord> records;
         auto files = getJournalFiles(input_dir, "insight_stock_trade_data");
-        std::cout << "[trade] Found " << files.size() << " journal files" << std::endl;
+        std::cout << "\n[trade] Found " << files.size() << " journal files" << std::endl;
         for (size_t fi = 0; fi < files.size(); ++fi) {
             const auto& filepath = files[fi];
             std::cout << "[trade] (" << (fi + 1) << "/" << files.size() << ") " << filepath << std::flush;
@@ -142,41 +149,22 @@ int main(int argc, char* argv[]) {
                 std::cout << " -- SKIP (load failed)" << std::endl;
                 continue;
             }
-
-            size_t count_before = trade_records.size();
+            size_t count_before = records.size();
             LocalFrameHeader* header;
             while ((header = page.nextFrame()) != nullptr) {
                 if (header->msg_type == MSG_TYPE_L2_TRADE) {
                     auto* md = (KyStdTradeType*)page.getFrameData(header);
-                    trade_records.push_back(convert_trade(*md, header->nano));
+                    records.push_back(convert_trade(*md, header->nano));
                 }
             }
-            std::cout << " -> +" << (trade_records.size() - count_before)
-                      << " (total: " << trade_records.size() << ")" << std::endl;
+            std::cout << " -> +" << (records.size() - count_before)
+                      << " (total: " << records.size() << ")" << std::endl;
         }
-    }
-
-    std::cout << "\n=== Summary ===" << std::endl;
-    std::cout << "Tick records:  " << tick_records.size() << std::endl;
-    std::cout << "Order records: " << order_records.size() << std::endl;
-    std::cout << "Trade records: " << trade_records.size() << std::endl;
-
-    // 写入 parquet（文件名以东八区当日日期开头）
-    std::string date = today_cst();
-    std::cout << "\nDate prefix: " << date << std::endl;
-
-    if (!tick_records.empty()) {
-        std::cout << "\nWriting tick parquet..." << std::endl;
-        write_tick_parquet(tick_records, output_dir + date + "_tick_data.parquet", max_rows_tick);
-    }
-    if (!order_records.empty()) {
-        std::cout << "\nWriting order parquet..." << std::endl;
-        write_order_parquet(order_records, output_dir + date + "_order_data.parquet", max_rows_order);
-    }
-    if (!trade_records.empty()) {
-        std::cout << "\nWriting trade parquet..." << std::endl;
-        write_trade_parquet(trade_records, output_dir + date + "_trade_data.parquet", max_rows_trade);
-    }
+        std::cout << "[trade] Total: " << records.size() << " records" << std::endl;
+        if (!records.empty()) {
+            write_trade_parquet(records, output_dir + date + "_trade_data.parquet", max_rows_trade);
+        }
+    } // trade_records 在这里释放
 
     std::cout << "\nDone." << std::endl;
     return 0;
