@@ -4,6 +4,7 @@
 #include "conversion.h"
 #include "parquet_writer.h"
 
+#include <ctime>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -18,6 +19,17 @@ static void print_usage(const char* prog) {
 
 static void ensure_dir(const std::string& path) {
     mkdir(path.c_str(), 0755);
+}
+
+// 获取东八区当日日期字符串 "YYYYMMDD"
+static std::string today_cst() {
+    time_t now = time(nullptr);
+    now += 8 * 3600; // UTC → UTC+8
+    struct tm t;
+    gmtime_r(&now, &t);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%04d%02d%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+    return buf;
 }
 
 int main(int argc, char* argv[]) {
@@ -149,18 +161,21 @@ int main(int argc, char* argv[]) {
     std::cout << "Order records: " << order_records.size() << std::endl;
     std::cout << "Trade records: " << trade_records.size() << std::endl;
 
-    // 写入 parquet
+    // 写入 parquet（文件名以东八区当日日期开头）
+    std::string date = today_cst();
+    std::cout << "\nDate prefix: " << date << std::endl;
+
     if (!tick_records.empty()) {
         std::cout << "\nWriting tick parquet..." << std::endl;
-        write_tick_parquet(tick_records, output_dir + "tick_data.parquet", max_rows_tick);
+        write_tick_parquet(tick_records, output_dir + date + "_tick_data.parquet", max_rows_tick);
     }
     if (!order_records.empty()) {
         std::cout << "\nWriting order parquet..." << std::endl;
-        write_order_parquet(order_records, output_dir + "order_data.parquet", max_rows_order);
+        write_order_parquet(order_records, output_dir + date + "_order_data.parquet", max_rows_order);
     }
     if (!trade_records.empty()) {
         std::cout << "\nWriting trade parquet..." << std::endl;
-        write_trade_parquet(trade_records, output_dir + "trade_data.parquet", max_rows_trade);
+        write_trade_parquet(trade_records, output_dir + date + "_trade_data.parquet", max_rows_trade);
     }
 
     std::cout << "\nDone." << std::endl;
