@@ -8,10 +8,9 @@ const short MSG_TYPE_L2_TICK  = 61;
 const short MSG_TYPE_L2_ORDER = 62;
 const short MSG_TYPE_L2_TRADE = 63;
 
-typedef int32_t  T_I32;
-typedef uint32_t T_U32;
-typedef long long T_I64;
-typedef double   float64_t;
+typedef double float64_t;
+
+// 以下结构体与 gateway 写入端完全一致（ht_insight_market_gateway/src/data/data_struct.hpp）
 
 struct KyStdTradeType {
     int32_t AskOrder;
@@ -26,9 +25,6 @@ struct KyStdTradeType {
     int32_t Time;
     int32_t Volume;
     int32_t Symbol;
-    int32_t Date;
-    int32_t Multiple;
-    int32_t Money;
 
     static constexpr short type_id = MSG_TYPE_L2_TRADE;
 } __attribute__((packed));
@@ -111,9 +107,6 @@ struct KyStdOrderType {
     int32_t Time;
     int32_t Volume;
     int32_t Symbol;
-    int32_t TradedQty;
-    int32_t Date;
-    int32_t Multiple;
 
     static constexpr short type_id = MSG_TYPE_L2_ORDER;
 } __attribute__((packed));
