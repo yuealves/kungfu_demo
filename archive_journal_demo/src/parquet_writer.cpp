@@ -5,9 +5,19 @@
 #include <parquet/arrow/writer.h>
 #include <parquet/properties.h>
 
+#include <cstdio>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+
+// 生成分片文件名: "dir/tick_data.parquet" + idx=1 → "dir/tick_data_001.parquet"
+static std::string make_chunk_path(const std::string& filepath, int idx) {
+    auto dot = filepath.rfind('.');
+    if (dot == std::string::npos) dot = filepath.size();
+    char buf[8];
+    snprintf(buf, sizeof(buf), "_%03d", idx);
+    return filepath.substr(0, dot) + buf + filepath.substr(dot);
+}
 
 #define ARROW_OK_OR_THROW(expr)                                  \
     do {                                                         \
@@ -98,127 +108,136 @@ static std::shared_ptr<arrow::Schema> tick_schema() {
     });
 }
 
-void write_tick_parquet(const std::vector<TickRecord>& records, const std::string& filepath) {
+void write_tick_parquet(const std::vector<TickRecord>& records, const std::string& filepath, size_t max_rows_per_file) {
     auto schema = tick_schema();
-
-    std::shared_ptr<arrow::io::FileOutputStream> outfile;
-    ARROW_ASSIGN_OR_THROW(outfile, arrow::io::FileOutputStream::Open(filepath));
-
-    auto props = parquet::WriterProperties::Builder()
-        .compression(arrow::Compression::SNAPPY)
-        ->build();
-    auto arrow_props = parquet::ArrowWriterProperties::Builder().store_schema()->build();
-
-    std::unique_ptr<parquet::arrow::FileWriter> writer;
-    ARROW_ASSIGN_OR_THROW(writer, parquet::arrow::FileWriter::Open(
-        *schema, arrow::default_memory_pool(), outfile, props, arrow_props));
-
     size_t total = records.size();
-    for (size_t offset = 0; offset < total; offset += ROW_GROUP_SIZE) {
-        size_t end = std::min(offset + (size_t)ROW_GROUP_SIZE, total);
-        size_t n = end - offset;
+    size_t rows_per_file = (max_rows_per_file > 0 && total > max_rows_per_file) ? max_rows_per_file : total;
+    size_t num_files = (total + rows_per_file - 1) / rows_per_file;
 
-        arrow::Int64Builder  nano_ts;
-        arrow::StringBuilder exchange;
-        arrow::Int32Builder  sym, time_f, afterMatchItem, afterVolume, matchItem, volume_f, bizIndex;
-        arrow::Int64Builder  accTurnover, accVolume, afterTurnover, totalAskVol, totalBidVol, turnover;
-        arrow::FloatBuilder  afterPrice, askAvgPrice, bidAvgPrice, high, low, open_f, preClose, price_f;
-        arrow::FloatBuilder  askPx[10], bidPx[10];
-        arrow::DoubleBuilder askVol[10], bidVol[10];
-        arrow::Int8Builder   bsFlag;
+    for (size_t file_idx = 0; file_idx < num_files; ++file_idx) {
+        size_t chunk_begin = file_idx * rows_per_file;
+        size_t chunk_end = std::min(chunk_begin + rows_per_file, total);
+        size_t chunk_rows = chunk_end - chunk_begin;
 
-        for (size_t i = offset; i < end; ++i) {
-            const auto& r = records[i];
-            ARROW_OK_OR_THROW(nano_ts.Append(r.nano_timestamp));
-            ARROW_OK_OR_THROW(exchange.Append(r.exchange));
-            ARROW_OK_OR_THROW(sym.Append(r.Symbol));
-            ARROW_OK_OR_THROW(time_f.Append(r.Time));
-            ARROW_OK_OR_THROW(accTurnover.Append(r.AccTurnover));
-            ARROW_OK_OR_THROW(accVolume.Append(r.AccVolume));
-            ARROW_OK_OR_THROW(afterMatchItem.Append(r.AfterMatchItem));
-            ARROW_OK_OR_THROW(afterPrice.Append(r.AfterPrice));
-            ARROW_OK_OR_THROW(afterTurnover.Append(r.AfterTurnover));
-            ARROW_OK_OR_THROW(afterVolume.Append(r.AfterVolume));
-            ARROW_OK_OR_THROW(askAvgPrice.Append(r.AskAvgPrice));
-            for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(askPx[j].Append(r.AskPx[j]));
-            for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(askVol[j].Append(r.AskVol[j]));
-            ARROW_OK_OR_THROW(bsFlag.Append(r.BSFlag));
-            ARROW_OK_OR_THROW(bidAvgPrice.Append(r.BidAvgPrice));
-            for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(bidPx[j].Append(r.BidPx[j]));
-            for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(bidVol[j].Append(r.BidVol[j]));
-            ARROW_OK_OR_THROW(high.Append(r.High));
-            ARROW_OK_OR_THROW(low.Append(r.Low));
-            ARROW_OK_OR_THROW(matchItem.Append(r.MatchItem));
-            ARROW_OK_OR_THROW(open_f.Append(r.Open));
-            ARROW_OK_OR_THROW(preClose.Append(r.PreClose));
-            ARROW_OK_OR_THROW(price_f.Append(r.Price));
-            ARROW_OK_OR_THROW(totalAskVol.Append(r.TotalAskVolume));
-            ARROW_OK_OR_THROW(totalBidVol.Append(r.TotalBidVolume));
-            ARROW_OK_OR_THROW(turnover.Append(r.Turnover));
-            ARROW_OK_OR_THROW(volume_f.Append(r.Volume));
-            ARROW_OK_OR_THROW(bizIndex.Append(r.BizIndex));
+        std::string actual_path = (num_files == 1) ? filepath : make_chunk_path(filepath, file_idx + 1);
+
+        std::shared_ptr<arrow::io::FileOutputStream> outfile;
+        ARROW_ASSIGN_OR_THROW(outfile, arrow::io::FileOutputStream::Open(actual_path));
+
+        auto props = parquet::WriterProperties::Builder()
+            .compression(arrow::Compression::SNAPPY)
+            ->build();
+        auto arrow_props = parquet::ArrowWriterProperties::Builder().store_schema()->build();
+
+        std::unique_ptr<parquet::arrow::FileWriter> writer;
+        ARROW_ASSIGN_OR_THROW(writer, parquet::arrow::FileWriter::Open(
+            *schema, arrow::default_memory_pool(), outfile, props, arrow_props));
+
+        for (size_t offset = chunk_begin; offset < chunk_end; offset += ROW_GROUP_SIZE) {
+            size_t end = std::min(offset + (size_t)ROW_GROUP_SIZE, chunk_end);
+            size_t n = end - offset;
+
+            arrow::Int64Builder  nano_ts;
+            arrow::StringBuilder exchange;
+            arrow::Int32Builder  sym, time_f, afterMatchItem, afterVolume, matchItem, volume_f, bizIndex;
+            arrow::Int64Builder  accTurnover, accVolume, afterTurnover, totalAskVol, totalBidVol, turnover;
+            arrow::FloatBuilder  afterPrice, askAvgPrice, bidAvgPrice, high, low, open_f, preClose, price_f;
+            arrow::FloatBuilder  askPx[10], bidPx[10];
+            arrow::DoubleBuilder askVol[10], bidVol[10];
+            arrow::Int8Builder   bsFlag;
+
+            for (size_t i = offset; i < end; ++i) {
+                const auto& r = records[i];
+                ARROW_OK_OR_THROW(nano_ts.Append(r.nano_timestamp));
+                ARROW_OK_OR_THROW(exchange.Append(r.exchange));
+                ARROW_OK_OR_THROW(sym.Append(r.Symbol));
+                ARROW_OK_OR_THROW(time_f.Append(r.Time));
+                ARROW_OK_OR_THROW(accTurnover.Append(r.AccTurnover));
+                ARROW_OK_OR_THROW(accVolume.Append(r.AccVolume));
+                ARROW_OK_OR_THROW(afterMatchItem.Append(r.AfterMatchItem));
+                ARROW_OK_OR_THROW(afterPrice.Append(r.AfterPrice));
+                ARROW_OK_OR_THROW(afterTurnover.Append(r.AfterTurnover));
+                ARROW_OK_OR_THROW(afterVolume.Append(r.AfterVolume));
+                ARROW_OK_OR_THROW(askAvgPrice.Append(r.AskAvgPrice));
+                for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(askPx[j].Append(r.AskPx[j]));
+                for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(askVol[j].Append(r.AskVol[j]));
+                ARROW_OK_OR_THROW(bsFlag.Append(r.BSFlag));
+                ARROW_OK_OR_THROW(bidAvgPrice.Append(r.BidAvgPrice));
+                for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(bidPx[j].Append(r.BidPx[j]));
+                for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(bidVol[j].Append(r.BidVol[j]));
+                ARROW_OK_OR_THROW(high.Append(r.High));
+                ARROW_OK_OR_THROW(low.Append(r.Low));
+                ARROW_OK_OR_THROW(matchItem.Append(r.MatchItem));
+                ARROW_OK_OR_THROW(open_f.Append(r.Open));
+                ARROW_OK_OR_THROW(preClose.Append(r.PreClose));
+                ARROW_OK_OR_THROW(price_f.Append(r.Price));
+                ARROW_OK_OR_THROW(totalAskVol.Append(r.TotalAskVolume));
+                ARROW_OK_OR_THROW(totalBidVol.Append(r.TotalBidVolume));
+                ARROW_OK_OR_THROW(turnover.Append(r.Turnover));
+                ARROW_OK_OR_THROW(volume_f.Append(r.Volume));
+                ARROW_OK_OR_THROW(bizIndex.Append(r.BizIndex));
+            }
+
+            std::shared_ptr<arrow::Array> a_nano, a_exch, a_sym, a_time, a_accTO, a_accVol,
+                a_afterMI, a_afterP, a_afterTO, a_afterVol, a_askAvg,
+                a_bsFlag, a_bidAvg,
+                a_high, a_low, a_matchItem, a_open, a_preClose, a_price,
+                a_totalAskVol, a_totalBidVol, a_turnover, a_volume, a_bizIndex;
+            std::shared_ptr<arrow::Array> a_askPx[10], a_askVol[10], a_bidPx[10], a_bidVol[10];
+
+            ARROW_OK_OR_THROW(nano_ts.Finish(&a_nano));
+            ARROW_OK_OR_THROW(exchange.Finish(&a_exch));
+            ARROW_OK_OR_THROW(sym.Finish(&a_sym));
+            ARROW_OK_OR_THROW(time_f.Finish(&a_time));
+            ARROW_OK_OR_THROW(accTurnover.Finish(&a_accTO));
+            ARROW_OK_OR_THROW(accVolume.Finish(&a_accVol));
+            ARROW_OK_OR_THROW(afterMatchItem.Finish(&a_afterMI));
+            ARROW_OK_OR_THROW(afterPrice.Finish(&a_afterP));
+            ARROW_OK_OR_THROW(afterTurnover.Finish(&a_afterTO));
+            ARROW_OK_OR_THROW(afterVolume.Finish(&a_afterVol));
+            ARROW_OK_OR_THROW(askAvgPrice.Finish(&a_askAvg));
+            for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(askPx[j].Finish(&a_askPx[j]));
+            for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(askVol[j].Finish(&a_askVol[j]));
+            ARROW_OK_OR_THROW(bsFlag.Finish(&a_bsFlag));
+            ARROW_OK_OR_THROW(bidAvgPrice.Finish(&a_bidAvg));
+            for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(bidPx[j].Finish(&a_bidPx[j]));
+            for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(bidVol[j].Finish(&a_bidVol[j]));
+            ARROW_OK_OR_THROW(high.Finish(&a_high));
+            ARROW_OK_OR_THROW(low.Finish(&a_low));
+            ARROW_OK_OR_THROW(matchItem.Finish(&a_matchItem));
+            ARROW_OK_OR_THROW(open_f.Finish(&a_open));
+            ARROW_OK_OR_THROW(preClose.Finish(&a_preClose));
+            ARROW_OK_OR_THROW(price_f.Finish(&a_price));
+            ARROW_OK_OR_THROW(totalAskVol.Finish(&a_totalAskVol));
+            ARROW_OK_OR_THROW(totalBidVol.Finish(&a_totalBidVol));
+            ARROW_OK_OR_THROW(turnover.Finish(&a_turnover));
+            ARROW_OK_OR_THROW(volume_f.Finish(&a_volume));
+            ARROW_OK_OR_THROW(bizIndex.Finish(&a_bizIndex));
+
+            std::vector<std::shared_ptr<arrow::Array>> columns = {
+                a_nano, a_exch, a_sym, a_time, a_accTO, a_accVol,
+                a_afterMI, a_afterP, a_afterTO, a_afterVol, a_askAvg,
+            };
+            for (int j = 0; j < 10; ++j) columns.push_back(a_askPx[j]);
+            for (int j = 0; j < 10; ++j) columns.push_back(a_askVol[j]);
+            columns.push_back(a_bsFlag);
+            columns.push_back(a_bidAvg);
+            for (int j = 0; j < 10; ++j) columns.push_back(a_bidPx[j]);
+            for (int j = 0; j < 10; ++j) columns.push_back(a_bidVol[j]);
+            columns.insert(columns.end(), {
+                a_high, a_low, a_matchItem, a_open, a_preClose, a_price,
+                a_totalAskVol, a_totalBidVol, a_turnover, a_volume, a_bizIndex,
+            });
+
+            auto table = arrow::Table::Make(schema, columns);
+            ARROW_OK_OR_THROW(writer->WriteTable(*table, n));
         }
 
-        // Finish all builders
-        std::shared_ptr<arrow::Array> a_nano, a_exch, a_sym, a_time, a_accTO, a_accVol,
-            a_afterMI, a_afterP, a_afterTO, a_afterVol, a_askAvg,
-            a_bsFlag, a_bidAvg,
-            a_high, a_low, a_matchItem, a_open, a_preClose, a_price,
-            a_totalAskVol, a_totalBidVol, a_turnover, a_volume, a_bizIndex;
-        std::shared_ptr<arrow::Array> a_askPx[10], a_askVol[10], a_bidPx[10], a_bidVol[10];
-
-        ARROW_OK_OR_THROW(nano_ts.Finish(&a_nano));
-        ARROW_OK_OR_THROW(exchange.Finish(&a_exch));
-        ARROW_OK_OR_THROW(sym.Finish(&a_sym));
-        ARROW_OK_OR_THROW(time_f.Finish(&a_time));
-        ARROW_OK_OR_THROW(accTurnover.Finish(&a_accTO));
-        ARROW_OK_OR_THROW(accVolume.Finish(&a_accVol));
-        ARROW_OK_OR_THROW(afterMatchItem.Finish(&a_afterMI));
-        ARROW_OK_OR_THROW(afterPrice.Finish(&a_afterP));
-        ARROW_OK_OR_THROW(afterTurnover.Finish(&a_afterTO));
-        ARROW_OK_OR_THROW(afterVolume.Finish(&a_afterVol));
-        ARROW_OK_OR_THROW(askAvgPrice.Finish(&a_askAvg));
-        for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(askPx[j].Finish(&a_askPx[j]));
-        for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(askVol[j].Finish(&a_askVol[j]));
-        ARROW_OK_OR_THROW(bsFlag.Finish(&a_bsFlag));
-        ARROW_OK_OR_THROW(bidAvgPrice.Finish(&a_bidAvg));
-        for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(bidPx[j].Finish(&a_bidPx[j]));
-        for (int j = 0; j < 10; ++j) ARROW_OK_OR_THROW(bidVol[j].Finish(&a_bidVol[j]));
-        ARROW_OK_OR_THROW(high.Finish(&a_high));
-        ARROW_OK_OR_THROW(low.Finish(&a_low));
-        ARROW_OK_OR_THROW(matchItem.Finish(&a_matchItem));
-        ARROW_OK_OR_THROW(open_f.Finish(&a_open));
-        ARROW_OK_OR_THROW(preClose.Finish(&a_preClose));
-        ARROW_OK_OR_THROW(price_f.Finish(&a_price));
-        ARROW_OK_OR_THROW(totalAskVol.Finish(&a_totalAskVol));
-        ARROW_OK_OR_THROW(totalBidVol.Finish(&a_totalBidVol));
-        ARROW_OK_OR_THROW(turnover.Finish(&a_turnover));
-        ARROW_OK_OR_THROW(volume_f.Finish(&a_volume));
-        ARROW_OK_OR_THROW(bizIndex.Finish(&a_bizIndex));
-
-        // Build column vector in schema order
-        std::vector<std::shared_ptr<arrow::Array>> columns = {
-            a_nano, a_exch, a_sym, a_time, a_accTO, a_accVol,
-            a_afterMI, a_afterP, a_afterTO, a_afterVol, a_askAvg,
-        };
-        for (int j = 0; j < 10; ++j) columns.push_back(a_askPx[j]);
-        for (int j = 0; j < 10; ++j) columns.push_back(a_askVol[j]);
-        columns.push_back(a_bsFlag);
-        columns.push_back(a_bidAvg);
-        for (int j = 0; j < 10; ++j) columns.push_back(a_bidPx[j]);
-        for (int j = 0; j < 10; ++j) columns.push_back(a_bidVol[j]);
-        columns.insert(columns.end(), {
-            a_high, a_low, a_matchItem, a_open, a_preClose, a_price,
-            a_totalAskVol, a_totalBidVol, a_turnover, a_volume, a_bizIndex,
-        });
-
-        auto table = arrow::Table::Make(schema, columns);
-        ARROW_OK_OR_THROW(writer->WriteTable(*table, n));
+        ARROW_OK_OR_THROW(writer->Close());
+        ARROW_OK_OR_THROW(outfile->Close());
+        std::cout << "  [" << (file_idx + 1) << "/" << num_files << "] Wrote "
+                  << chunk_rows << " tick records to " << actual_path << std::endl;
     }
-
-    ARROW_OK_OR_THROW(writer->Close());
-    ARROW_OK_OR_THROW(outfile->Close());
-    std::cout << "Wrote " << total << " tick records to " << filepath << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,76 +260,87 @@ static std::shared_ptr<arrow::Schema> order_schema() {
     });
 }
 
-void write_order_parquet(const std::vector<OrderRecord>& records, const std::string& filepath) {
+void write_order_parquet(const std::vector<OrderRecord>& records, const std::string& filepath, size_t max_rows_per_file) {
     auto schema = order_schema();
-
-    std::shared_ptr<arrow::io::FileOutputStream> outfile;
-    ARROW_ASSIGN_OR_THROW(outfile, arrow::io::FileOutputStream::Open(filepath));
-
-    auto props = parquet::WriterProperties::Builder()
-        .compression(arrow::Compression::SNAPPY)
-        ->build();
-    auto arrow_props = parquet::ArrowWriterProperties::Builder().store_schema()->build();
-
-    std::unique_ptr<parquet::arrow::FileWriter> writer;
-    ARROW_ASSIGN_OR_THROW(writer, parquet::arrow::FileWriter::Open(
-        *schema, arrow::default_memory_pool(), outfile, props, arrow_props));
-
     size_t total = records.size();
-    for (size_t offset = 0; offset < total; offset += ROW_GROUP_SIZE) {
-        size_t end = std::min(offset + (size_t)ROW_GROUP_SIZE, total);
-        size_t n = end - offset;
+    size_t rows_per_file = (max_rows_per_file > 0 && total > max_rows_per_file) ? max_rows_per_file : total;
+    size_t num_files = (total + rows_per_file - 1) / rows_per_file;
 
-        arrow::Int64Builder  nano_ts, channel;
-        arrow::StringBuilder exchange;
-        arrow::Int32Builder  sym, bizIndex, orderNumber, orderOriNo, time_f, volume_f;
-        arrow::Int8Builder   functionCode, orderKind;
-        arrow::FloatBuilder  price;
+    for (size_t file_idx = 0; file_idx < num_files; ++file_idx) {
+        size_t chunk_begin = file_idx * rows_per_file;
+        size_t chunk_end = std::min(chunk_begin + rows_per_file, total);
+        size_t chunk_rows = chunk_end - chunk_begin;
 
-        for (size_t i = offset; i < end; ++i) {
-            const auto& r = records[i];
-            ARROW_OK_OR_THROW(nano_ts.Append(r.nano_timestamp));
-            ARROW_OK_OR_THROW(exchange.Append(r.exchange));
-            ARROW_OK_OR_THROW(sym.Append(r.Symbol));
-            ARROW_OK_OR_THROW(bizIndex.Append(r.BizIndex));
-            ARROW_OK_OR_THROW(channel.Append(r.Channel));
-            ARROW_OK_OR_THROW(functionCode.Append(r.FunctionCode));
-            ARROW_OK_OR_THROW(orderKind.Append(r.OrderKind));
-            ARROW_OK_OR_THROW(orderNumber.Append(r.OrderNumber));
-            ARROW_OK_OR_THROW(orderOriNo.Append(r.OrderOriNo));
-            ARROW_OK_OR_THROW(price.Append(r.Price));
-            ARROW_OK_OR_THROW(time_f.Append(r.Time));
-            ARROW_OK_OR_THROW(volume_f.Append(r.Volume));
+        std::string actual_path = (num_files == 1) ? filepath : make_chunk_path(filepath, file_idx + 1);
+
+        std::shared_ptr<arrow::io::FileOutputStream> outfile;
+        ARROW_ASSIGN_OR_THROW(outfile, arrow::io::FileOutputStream::Open(actual_path));
+
+        auto props = parquet::WriterProperties::Builder()
+            .compression(arrow::Compression::SNAPPY)
+            ->build();
+        auto arrow_props = parquet::ArrowWriterProperties::Builder().store_schema()->build();
+
+        std::unique_ptr<parquet::arrow::FileWriter> writer;
+        ARROW_ASSIGN_OR_THROW(writer, parquet::arrow::FileWriter::Open(
+            *schema, arrow::default_memory_pool(), outfile, props, arrow_props));
+
+        for (size_t offset = chunk_begin; offset < chunk_end; offset += ROW_GROUP_SIZE) {
+            size_t end = std::min(offset + (size_t)ROW_GROUP_SIZE, chunk_end);
+            size_t n = end - offset;
+
+            arrow::Int64Builder  nano_ts, channel;
+            arrow::StringBuilder exchange;
+            arrow::Int32Builder  sym, bizIndex, orderNumber, orderOriNo, time_f, volume_f;
+            arrow::Int8Builder   functionCode, orderKind;
+            arrow::FloatBuilder  price;
+
+            for (size_t i = offset; i < end; ++i) {
+                const auto& r = records[i];
+                ARROW_OK_OR_THROW(nano_ts.Append(r.nano_timestamp));
+                ARROW_OK_OR_THROW(exchange.Append(r.exchange));
+                ARROW_OK_OR_THROW(sym.Append(r.Symbol));
+                ARROW_OK_OR_THROW(bizIndex.Append(r.BizIndex));
+                ARROW_OK_OR_THROW(channel.Append(r.Channel));
+                ARROW_OK_OR_THROW(functionCode.Append(r.FunctionCode));
+                ARROW_OK_OR_THROW(orderKind.Append(r.OrderKind));
+                ARROW_OK_OR_THROW(orderNumber.Append(r.OrderNumber));
+                ARROW_OK_OR_THROW(orderOriNo.Append(r.OrderOriNo));
+                ARROW_OK_OR_THROW(price.Append(r.Price));
+                ARROW_OK_OR_THROW(time_f.Append(r.Time));
+                ARROW_OK_OR_THROW(volume_f.Append(r.Volume));
+            }
+
+            std::shared_ptr<arrow::Array> a_nano, a_exch, a_sym, a_bizIndex, a_channel,
+                a_funcCode, a_orderKind, a_orderNum, a_orderOriNo, a_price, a_time, a_volume;
+
+            ARROW_OK_OR_THROW(nano_ts.Finish(&a_nano));
+            ARROW_OK_OR_THROW(exchange.Finish(&a_exch));
+            ARROW_OK_OR_THROW(sym.Finish(&a_sym));
+            ARROW_OK_OR_THROW(bizIndex.Finish(&a_bizIndex));
+            ARROW_OK_OR_THROW(channel.Finish(&a_channel));
+            ARROW_OK_OR_THROW(functionCode.Finish(&a_funcCode));
+            ARROW_OK_OR_THROW(orderKind.Finish(&a_orderKind));
+            ARROW_OK_OR_THROW(orderNumber.Finish(&a_orderNum));
+            ARROW_OK_OR_THROW(orderOriNo.Finish(&a_orderOriNo));
+            ARROW_OK_OR_THROW(price.Finish(&a_price));
+            ARROW_OK_OR_THROW(time_f.Finish(&a_time));
+            ARROW_OK_OR_THROW(volume_f.Finish(&a_volume));
+
+            auto table = arrow::Table::Make(schema, {
+                a_nano, a_exch, a_sym, a_bizIndex, a_channel,
+                a_funcCode, a_orderKind, a_orderNum, a_orderOriNo,
+                a_price, a_time, a_volume,
+            });
+
+            ARROW_OK_OR_THROW(writer->WriteTable(*table, n));
         }
 
-        std::shared_ptr<arrow::Array> a_nano, a_exch, a_sym, a_bizIndex, a_channel,
-            a_funcCode, a_orderKind, a_orderNum, a_orderOriNo, a_price, a_time, a_volume;
-
-        ARROW_OK_OR_THROW(nano_ts.Finish(&a_nano));
-        ARROW_OK_OR_THROW(exchange.Finish(&a_exch));
-        ARROW_OK_OR_THROW(sym.Finish(&a_sym));
-        ARROW_OK_OR_THROW(bizIndex.Finish(&a_bizIndex));
-        ARROW_OK_OR_THROW(channel.Finish(&a_channel));
-        ARROW_OK_OR_THROW(functionCode.Finish(&a_funcCode));
-        ARROW_OK_OR_THROW(orderKind.Finish(&a_orderKind));
-        ARROW_OK_OR_THROW(orderNumber.Finish(&a_orderNum));
-        ARROW_OK_OR_THROW(orderOriNo.Finish(&a_orderOriNo));
-        ARROW_OK_OR_THROW(price.Finish(&a_price));
-        ARROW_OK_OR_THROW(time_f.Finish(&a_time));
-        ARROW_OK_OR_THROW(volume_f.Finish(&a_volume));
-
-        auto table = arrow::Table::Make(schema, {
-            a_nano, a_exch, a_sym, a_bizIndex, a_channel,
-            a_funcCode, a_orderKind, a_orderNum, a_orderOriNo,
-            a_price, a_time, a_volume,
-        });
-
-        ARROW_OK_OR_THROW(writer->WriteTable(*table, n));
+        ARROW_OK_OR_THROW(writer->Close());
+        ARROW_OK_OR_THROW(outfile->Close());
+        std::cout << "  [" << (file_idx + 1) << "/" << num_files << "] Wrote "
+                  << chunk_rows << " order records to " << actual_path << std::endl;
     }
-
-    ARROW_OK_OR_THROW(writer->Close());
-    ARROW_OK_OR_THROW(outfile->Close());
-    std::cout << "Wrote " << total << " order records to " << filepath << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -335,79 +365,90 @@ static std::shared_ptr<arrow::Schema> trade_schema() {
     });
 }
 
-void write_trade_parquet(const std::vector<TradeRecord>& records, const std::string& filepath) {
+void write_trade_parquet(const std::vector<TradeRecord>& records, const std::string& filepath, size_t max_rows_per_file) {
     auto schema = trade_schema();
-
-    std::shared_ptr<arrow::io::FileOutputStream> outfile;
-    ARROW_ASSIGN_OR_THROW(outfile, arrow::io::FileOutputStream::Open(filepath));
-
-    auto props = parquet::WriterProperties::Builder()
-        .compression(arrow::Compression::SNAPPY)
-        ->build();
-    auto arrow_props = parquet::ArrowWriterProperties::Builder().store_schema()->build();
-
-    std::unique_ptr<parquet::arrow::FileWriter> writer;
-    ARROW_ASSIGN_OR_THROW(writer, parquet::arrow::FileWriter::Open(
-        *schema, arrow::default_memory_pool(), outfile, props, arrow_props));
-
     size_t total = records.size();
-    for (size_t offset = 0; offset < total; offset += ROW_GROUP_SIZE) {
-        size_t end = std::min(offset + (size_t)ROW_GROUP_SIZE, total);
-        size_t n = end - offset;
+    size_t rows_per_file = (max_rows_per_file > 0 && total > max_rows_per_file) ? max_rows_per_file : total;
+    size_t num_files = (total + rows_per_file - 1) / rows_per_file;
 
-        arrow::Int64Builder  nano_ts;
-        arrow::StringBuilder exchange;
-        arrow::Int32Builder  sym, askOrder, bidOrder, bizIndex, channel, index_f, time_f, volume_f;
-        arrow::Int8Builder   bsFlag, functionCode, orderKind;
-        arrow::FloatBuilder  price;
+    for (size_t file_idx = 0; file_idx < num_files; ++file_idx) {
+        size_t chunk_begin = file_idx * rows_per_file;
+        size_t chunk_end = std::min(chunk_begin + rows_per_file, total);
+        size_t chunk_rows = chunk_end - chunk_begin;
 
-        for (size_t i = offset; i < end; ++i) {
-            const auto& r = records[i];
-            ARROW_OK_OR_THROW(nano_ts.Append(r.nano_timestamp));
-            ARROW_OK_OR_THROW(exchange.Append(r.exchange));
-            ARROW_OK_OR_THROW(sym.Append(r.Symbol));
-            ARROW_OK_OR_THROW(askOrder.Append(r.AskOrder));
-            ARROW_OK_OR_THROW(bsFlag.Append(r.BSFlag));
-            ARROW_OK_OR_THROW(bidOrder.Append(r.BidOrder));
-            ARROW_OK_OR_THROW(bizIndex.Append(r.BizIndex));
-            ARROW_OK_OR_THROW(channel.Append(r.Channel));
-            ARROW_OK_OR_THROW(functionCode.Append(r.FunctionCode));
-            ARROW_OK_OR_THROW(index_f.Append(r.Index));
-            ARROW_OK_OR_THROW(orderKind.Append(r.OrderKind));
-            ARROW_OK_OR_THROW(price.Append(r.Price));
-            ARROW_OK_OR_THROW(time_f.Append(r.Time));
-            ARROW_OK_OR_THROW(volume_f.Append(r.Volume));
+        std::string actual_path = (num_files == 1) ? filepath : make_chunk_path(filepath, file_idx + 1);
+
+        std::shared_ptr<arrow::io::FileOutputStream> outfile;
+        ARROW_ASSIGN_OR_THROW(outfile, arrow::io::FileOutputStream::Open(actual_path));
+
+        auto props = parquet::WriterProperties::Builder()
+            .compression(arrow::Compression::SNAPPY)
+            ->build();
+        auto arrow_props = parquet::ArrowWriterProperties::Builder().store_schema()->build();
+
+        std::unique_ptr<parquet::arrow::FileWriter> writer;
+        ARROW_ASSIGN_OR_THROW(writer, parquet::arrow::FileWriter::Open(
+            *schema, arrow::default_memory_pool(), outfile, props, arrow_props));
+
+        for (size_t offset = chunk_begin; offset < chunk_end; offset += ROW_GROUP_SIZE) {
+            size_t end = std::min(offset + (size_t)ROW_GROUP_SIZE, chunk_end);
+            size_t n = end - offset;
+
+            arrow::Int64Builder  nano_ts;
+            arrow::StringBuilder exchange;
+            arrow::Int32Builder  sym, askOrder, bidOrder, bizIndex, channel, index_f, time_f, volume_f;
+            arrow::Int8Builder   bsFlag, functionCode, orderKind;
+            arrow::FloatBuilder  price;
+
+            for (size_t i = offset; i < end; ++i) {
+                const auto& r = records[i];
+                ARROW_OK_OR_THROW(nano_ts.Append(r.nano_timestamp));
+                ARROW_OK_OR_THROW(exchange.Append(r.exchange));
+                ARROW_OK_OR_THROW(sym.Append(r.Symbol));
+                ARROW_OK_OR_THROW(askOrder.Append(r.AskOrder));
+                ARROW_OK_OR_THROW(bsFlag.Append(r.BSFlag));
+                ARROW_OK_OR_THROW(bidOrder.Append(r.BidOrder));
+                ARROW_OK_OR_THROW(bizIndex.Append(r.BizIndex));
+                ARROW_OK_OR_THROW(channel.Append(r.Channel));
+                ARROW_OK_OR_THROW(functionCode.Append(r.FunctionCode));
+                ARROW_OK_OR_THROW(index_f.Append(r.Index));
+                ARROW_OK_OR_THROW(orderKind.Append(r.OrderKind));
+                ARROW_OK_OR_THROW(price.Append(r.Price));
+                ARROW_OK_OR_THROW(time_f.Append(r.Time));
+                ARROW_OK_OR_THROW(volume_f.Append(r.Volume));
+            }
+
+            std::shared_ptr<arrow::Array> a_nano, a_exch, a_sym, a_askOrder, a_bsFlag,
+                a_bidOrder, a_bizIndex, a_channel, a_funcCode, a_index, a_orderKind,
+                a_price, a_time, a_volume;
+
+            ARROW_OK_OR_THROW(nano_ts.Finish(&a_nano));
+            ARROW_OK_OR_THROW(exchange.Finish(&a_exch));
+            ARROW_OK_OR_THROW(sym.Finish(&a_sym));
+            ARROW_OK_OR_THROW(askOrder.Finish(&a_askOrder));
+            ARROW_OK_OR_THROW(bsFlag.Finish(&a_bsFlag));
+            ARROW_OK_OR_THROW(bidOrder.Finish(&a_bidOrder));
+            ARROW_OK_OR_THROW(bizIndex.Finish(&a_bizIndex));
+            ARROW_OK_OR_THROW(channel.Finish(&a_channel));
+            ARROW_OK_OR_THROW(functionCode.Finish(&a_funcCode));
+            ARROW_OK_OR_THROW(index_f.Finish(&a_index));
+            ARROW_OK_OR_THROW(orderKind.Finish(&a_orderKind));
+            ARROW_OK_OR_THROW(price.Finish(&a_price));
+            ARROW_OK_OR_THROW(time_f.Finish(&a_time));
+            ARROW_OK_OR_THROW(volume_f.Finish(&a_volume));
+
+            auto table = arrow::Table::Make(schema, {
+                a_nano, a_exch, a_sym, a_askOrder, a_bsFlag,
+                a_bidOrder, a_bizIndex, a_channel, a_funcCode,
+                a_index, a_orderKind, a_price, a_time, a_volume,
+            });
+
+            ARROW_OK_OR_THROW(writer->WriteTable(*table, n));
         }
 
-        std::shared_ptr<arrow::Array> a_nano, a_exch, a_sym, a_askOrder, a_bsFlag,
-            a_bidOrder, a_bizIndex, a_channel, a_funcCode, a_index, a_orderKind,
-            a_price, a_time, a_volume;
-
-        ARROW_OK_OR_THROW(nano_ts.Finish(&a_nano));
-        ARROW_OK_OR_THROW(exchange.Finish(&a_exch));
-        ARROW_OK_OR_THROW(sym.Finish(&a_sym));
-        ARROW_OK_OR_THROW(askOrder.Finish(&a_askOrder));
-        ARROW_OK_OR_THROW(bsFlag.Finish(&a_bsFlag));
-        ARROW_OK_OR_THROW(bidOrder.Finish(&a_bidOrder));
-        ARROW_OK_OR_THROW(bizIndex.Finish(&a_bizIndex));
-        ARROW_OK_OR_THROW(channel.Finish(&a_channel));
-        ARROW_OK_OR_THROW(functionCode.Finish(&a_funcCode));
-        ARROW_OK_OR_THROW(index_f.Finish(&a_index));
-        ARROW_OK_OR_THROW(orderKind.Finish(&a_orderKind));
-        ARROW_OK_OR_THROW(price.Finish(&a_price));
-        ARROW_OK_OR_THROW(time_f.Finish(&a_time));
-        ARROW_OK_OR_THROW(volume_f.Finish(&a_volume));
-
-        auto table = arrow::Table::Make(schema, {
-            a_nano, a_exch, a_sym, a_askOrder, a_bsFlag,
-            a_bidOrder, a_bizIndex, a_channel, a_funcCode,
-            a_index, a_orderKind, a_price, a_time, a_volume,
-        });
-
-        ARROW_OK_OR_THROW(writer->WriteTable(*table, n));
+        ARROW_OK_OR_THROW(writer->Close());
+        ARROW_OK_OR_THROW(outfile->Close());
+        std::cout << "  [" << (file_idx + 1) << "/" << num_files << "] Wrote "
+                  << chunk_rows << " trade records to " << actual_path << std::endl;
     }
-
-    ARROW_OK_OR_THROW(writer->Close());
-    ARROW_OK_OR_THROW(outfile->Close());
-    std::cout << "Wrote " << total << " trade records to " << filepath << std::endl;
 }
