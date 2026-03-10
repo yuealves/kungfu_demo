@@ -1,0 +1,41 @@
+# Build
+build/
+bld-*/
+*.o
+*.so
+*.a
+*.dylib
+cmake-build-*/
+compile_commands.json
+.cache/
+.ccls-cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+*.egg
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (large files)
+*.journal
+*.parquet
+*.tar.gz
+
+# Secrets
+*.pem
+*.key
