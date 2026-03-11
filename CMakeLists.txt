@@ -85,6 +85,8 @@ TARGET_LINK_LIBRARIES(journal_replayer insight_handle)
 ADD_EXECUTABLE(live_reader live_reader.cpp)
 TARGET_LINK_LIBRARIES(live_reader insight_handle)
 
+ADD_EXECUTABLE(verify_journal_time verify_journal_time.cpp)
+TARGET_LINK_LIBRARIES(verify_journal_time insight_handle)
 
 
 

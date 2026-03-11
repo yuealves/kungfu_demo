@@ -251,4 +251,4 @@ inline long get_local_diff()
 | [JournalWriter.h](https://github.com/kungfu-origin/kungfu/blob/1.0.0/yijinjing/journal/JournalWriter.h) | `write_frame()` 内部调用 `getNanoTime()` |
 | [FrameHeader.h](https://github.com/kungfu-origin/kungfu/blob/1.0.0/yijinjing/journal/FrameHeader.h) | Frame 头部结构，`nano` 字段定义 |
 | `monitor_latency/src/main.cpp` | 监控进程，发现问题的起点 |
-| `market_gateway/src/brokers/insight_tcp/insight_gateway.h` | AsyncBatchWriter 写入流程 |
+| `insight_market_gateway/src/brokers/insight_tcp/insight_gateway.h` | AsyncBatchWriter 写入流程 |
