@@ -87,7 +87,11 @@ TARGET_LINK_LIBRARIES(live_reader insight_handle)
 
 ADD_EXECUTABLE(verify_journal_time tests/verify_journal_time.cpp)
 TARGET_LINK_LIBRARIES(verify_journal_time insight_handle)
+# RUNPATH 替代 RPATH，允许 LD_LIBRARY_PATH 覆盖（测试新 libjournal.so 时需要）
+set_target_properties(verify_journal_time PROPERTIES LINK_FLAGS "-Wl,--enable-new-dtags")
 
 ADD_EXECUTABLE(verify_nanotime tests/verify_nanotime.cpp)
 TARGET_LINK_LIBRARIES(verify_nanotime dl)
+# verify_nanotime 通过 dlopen 加载 libjournal.so，清除 RPATH 让 LD_LIBRARY_PATH 生效
+set_target_properties(verify_nanotime PROPERTIES SKIP_BUILD_RPATH TRUE)
 
