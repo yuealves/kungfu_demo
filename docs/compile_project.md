@@ -267,6 +267,14 @@ kungfu_demo/scripts/verify_nanotime_fix.sh  # 一键验证脚本
 
 CMakeLists.txt 已添加 `verify_journal_time` 目标，git pull 后即可编译。
 
+**RPATH 说明**：CMakeLists.txt 全局设置了 `--enable-new-dtags`，所有可执行文件和共享库使用 RUNPATH（而非 RPATH）。RUNPATH 允许 `LD_LIBRARY_PATH` 覆盖库搜索路径，因此测试新版 `libjournal.so` 时只需设置 `LD_LIBRARY_PATH` 即可，无需重新编译。
+
+**LD_LIBRARY_PATH 说明**：运行时需要包含以下路径：
+- 新 .so 所在目录（如 `/tmp/new_journal`，放在最前面优先加载）
+- `../lib`（项目本地第三方库：ACE、Protobuf、mdc_gateway_client）
+- `/opt/kungfu/master/lib/yijinjing`（KungFu 原版库，作为 fallback）
+- `/opt/kungfu/toolchain/boost-1.62.0/lib`（Boost 1.62.0）
+
 ### 5.2 方法一：独立测试（推荐，最直接）
 
 `tests/verify_nanotime.cpp` 通过 `dlopen` 加载 libjournal.so，直接对比 `getNanoTime()` 与 `clock_gettime(CLOCK_REALTIME)`，不依赖任何 KungFu 头文件或 Paged 服务。
@@ -324,7 +332,7 @@ cp libjournal.so.1.1 /tmp/new_journal/
 ln -sf libjournal.so.1.1 /tmp/new_journal/libjournal.so
 
 # Step 2: 设置 LD_LIBRARY_PATH（新 .so 在最前面）
-export LD_LIBRARY_PATH=/tmp/new_journal:/opt/kungfu/master/lib/yijinjing:/opt/kungfu/master/lib/boost
+export LD_LIBRARY_PATH=/tmp/new_journal:../lib:/opt/kungfu/master/lib/yijinjing:/opt/kungfu/toolchain/boost-1.62.0/lib
 
 # Step 3: 编译
 cd kungfu_demo/build
@@ -334,12 +342,12 @@ cmake .. -DCMAKE_BUILD_TYPE=Release && make verify_journal_time journal_replayer
 bash ../scripts/start_paged.sh
 
 # Step 5: 启动验证 reader（终端 2）
-export LD_LIBRARY_PATH=/tmp/new_journal:/opt/kungfu/master/lib/yijinjing:/opt/kungfu/master/lib/boost
+export LD_LIBRARY_PATH=/tmp/new_journal:../lib:/opt/kungfu/master/lib/yijinjing:/opt/kungfu/toolchain/boost-1.62.0/lib
 cd kungfu_demo/build
 ./verify_journal_time
 
 # Step 6: 启动 replayer（终端 3）
-export LD_LIBRARY_PATH=/tmp/new_journal:/opt/kungfu/master/lib/yijinjing:/opt/kungfu/master/lib/boost
+export LD_LIBRARY_PATH=/tmp/new_journal:../lib:/opt/kungfu/master/lib/yijinjing:/opt/kungfu/toolchain/boost-1.62.0/lib
 cd kungfu_demo/build
 ./journal_replayer 10
 ```
