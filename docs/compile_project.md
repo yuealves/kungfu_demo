@@ -260,8 +260,8 @@ build/src/brokers/insight_tcp/
 kungfu_source/build/yijinjing/journal/libjournal.so.1.1    # 新编译的 .so
 
 # 验证程序源码（在测试环境编译）
-kungfu_demo/verify_nanotime.cpp        # 独立测试，不依赖 KungFu 头文件
-kungfu_demo/verify_journal_time.cpp    # replayer/reader 流程测试
+kungfu_demo/tests/verify_nanotime.cpp        # 独立测试，不依赖 KungFu 头文件
+kungfu_demo/tests/verify_journal_time.cpp    # replayer/reader 流程测试
 kungfu_demo/scripts/verify_nanotime_fix.sh  # 一键验证脚本
 ```
 
@@ -269,7 +269,7 @@ CMakeLists.txt 已添加 `verify_journal_time` 目标，git pull 后即可编译
 
 ### 5.2 方法一：独立测试（推荐，最直接）
 
-`verify_nanotime.cpp` 通过 `dlopen` 加载 libjournal.so，直接对比 `getNanoTime()` 与 `clock_gettime(CLOCK_REALTIME)`，不依赖任何 KungFu 头文件或 Paged 服务。
+`tests/verify_nanotime.cpp` 通过 `dlopen` 加载 libjournal.so，直接对比 `getNanoTime()` 与 `clock_gettime(CLOCK_REALTIME)`，不依赖任何 KungFu 头文件或 Paged 服务。
 
 ```bash
 # Step 1: 将新 .so 放到测试环境某个目录
@@ -279,7 +279,7 @@ ln -sf libjournal.so.1.1 /tmp/new_journal/libjournal.so
 
 # Step 2: 编译测试程序
 cd kungfu_demo
-g++ -std=c++11 -O2 -o verify_nanotime verify_nanotime.cpp -ldl
+g++ -std=c++11 -O2 -o verify_nanotime tests/verify_nanotime.cpp -ldl
 
 # Step 3: 用新 .so 运行
 LD_LIBRARY_PATH=/tmp/new_journal ./verify_nanotime

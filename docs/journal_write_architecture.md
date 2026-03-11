@@ -41,7 +41,7 @@ KungFu 自带的行情引擎写入路径和频道名是硬编码的（来自 `LF
 
 **依据三：数据结构对应关系**
 
-项目中的 `KyStdSnpType`、`KyStdOrderType`、`KyStdTradeType`（`data_struct.hpp`）是 L2 Level-2 行情的 packed 结构，包含逐笔委托、逐笔成交等深度数据，这正是 Insight SDK 提供的数据类型。
+项目中的 `KyStdSnpType`、`KyStdOrderType`、`KyStdTradeType`（`src/data_struct.hpp`）是 L2 Level-2 行情的 packed 结构，包含逐笔委托、逐笔成交等深度数据，这正是 Insight SDK 提供的数据类型。
 
 **依据四：KungFu 自带的 MD 引擎没有启用**
 

@@ -58,7 +58,7 @@ make verify_journal_time -j$(nproc) 2>&1 | tail -3
 echo ""
 
 # 编译独立测试程序
-g++ -std=c++11 -O2 -o verify_nanotime "$PROJECT_DIR/verify_nanotime.cpp" -ldl
+g++ -std=c++11 -O2 -o verify_nanotime "$PROJECT_DIR/tests/verify_nanotime.cpp" -ldl
 
 # ---------- 方法一：独立测试 ----------
 echo "========================================"

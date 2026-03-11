@@ -4,7 +4,7 @@
 
 ## 1. 为什么用 mmap 读取 Journal
 
-`LocalJournalPage::load()` (`data_consumer.cpp:62-84`) 使用 `mmap` 将 journal 文件映射到进程虚拟地址空间：
+`LocalJournalPage::load()` (`src/data_consumer.cpp:62-84`) 使用 `mmap` 将 journal 文件映射到进程虚拟地址空间：
 
 ```cpp
 buffer = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
@@ -23,11 +23,11 @@ close(fd);
 mmap 成功后 `close(fd)` 不影响映射，`buffer` 指针可以直接当内存数组使用：
 
 ```cpp
-// data_consumer.cpp:89
+// src/data_consumer.cpp:89
 LocalFrameHeader* header = (LocalFrameHeader*)((char*)buffer + current_pos);
 ```
 
-析构时由 `munmap(buffer, size)` (`data_consumer.cpp:58`) 释放映射。
+析构时由 `munmap(buffer, size)` (`src/data_consumer.cpp:58`) 释放映射。
 
 ### mmap vs read() 对比
 
@@ -106,7 +106,7 @@ pthread_mutex_init(mtx, &attr);
 
 ### status 字段作为发布屏障
 
-`LocalFrameHeader` (`data_consumer.cpp:32-43`) 中：
+`LocalFrameHeader` (`src/data_consumer.cpp:32-43`) 中：
 
 ```cpp
 struct LocalFrameHeader {
@@ -125,7 +125,7 @@ Writer 的写入顺序：
 3. 最后写 status = 1（JOURNAL_FRAME_STATUS_WRITTEN）← 发布操作
 ```
 
-Reader 在 `nextFrame()` (`data_consumer.cpp:86-99`) 中检查：
+Reader 在 `nextFrame()` (`src/data_consumer.cpp:86-99`) 中检查：
 
 ```cpp
 LocalFrameHeader* nextFrame() {
@@ -143,7 +143,7 @@ LocalFrameHeader* nextFrame() {
 }
 ```
 
-上层调用（`data_consumer.cpp:160-177`）：
+上层调用（`src/data_consumer.cpp:160-177`）：
 
 ```cpp
 LocalFrameHeader* header;
