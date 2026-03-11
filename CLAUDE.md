@@ -34,7 +34,7 @@ C++17，`-O3 -Wall -fPIC`，CMake >= 3.18。
 cd build && ./data_consumer
 ```
 
-journal 文件路径由 CMake 宏 `PROJECT_ROOT_DIR` 设定，在 `data_consumer.h` 中引用。如需更换数据，修改 `DataConsumer` 的 `path` 成员。
+journal 文件路径由 CMake 宏 `PROJECT_ROOT_DIR` 设定，在 `src/data_consumer.h` 中引用。如需更换数据，修改 `DataConsumer` 的 `path` 成员。
 
 ### 本地模拟回放
 
@@ -50,31 +50,31 @@ scripts/stop_paged.sh       # 停止 Paged
 
 两层数据模型 + journal 读取器按消息类型分发：
 
-**第一层 — KungFu 原始结构体**（`data_struct.hpp`）：`KyStdSnpType`、`KyStdOrderType`、`KyStdTradeType`，`__attribute__((packed))` 二进制布局，直接对应 journal frame payload。
+**第一层 — KungFu 原始结构体**（`src/data_struct.hpp`）：`KyStdSnpType`、`KyStdOrderType`、`KyStdTradeType`，`__attribute__((packed))` 二进制布局，直接对应 journal frame payload。
 
-**第二层 — L2 输出结构体**（`insight_types.h`）：`L2StockTickDataField`、`SH/SZ_StockStepOrderField`、`SH/SZ_StockStepTradeField`，提供 `to_string()` 和 `to_csv_row()` 方法。
+**第二层 — L2 输出结构体**（`src/insight_types.h`）：`L2StockTickDataField`、`SH/SZ_StockStepOrderField`、`SH/SZ_StockStepTradeField`，提供 `to_string()` 和 `to_csv_row()` 方法。
 
-**转换函数**（`insight_types.cpp`）：`trans_tick()`、`trans_order()`、`trans_trade()` 将第一层转为第二层。Order 和 Trade 根据交易所返回 `std::variant`（SZ/SH）。
+**转换函数**（`src/insight_types.cpp`）：`trans_tick()`、`trans_order()`、`trans_trade()` 将第一层转为第二层。Order 和 Trade 根据交易所返回 `std::variant`（SZ/SH）。
 
-**Journal 读取**（`data_consumer.cpp`）：`LocalJournalPage` 使用 `mmap()` 读取 `yjj.<channel>.<page>.journal` 文件。Frame 有 40 字节 `LocalFrameHeader`，按 `msg_type` 分发：
+**Journal 读取**（`src/data_consumer.cpp`）：`LocalJournalPage` 使用 `mmap()` 读取 `yjj.<channel>.<page>.journal` 文件。Frame 有 40 字节 `LocalFrameHeader`，按 `msg_type` 分发：
 - 61 (`MSG_TYPE_L2_TICK`) → `on_market_data()`
 - 62 (`MSG_TYPE_L2_ORDER`) → `on_order_data()`
 - 63 (`MSG_TYPE_L2_TRADE`) → `on_trade_data()`
 
-**两个消费者类**（`data_consumer.h`）：
+**两个消费者类**（`src/data_consumer.h`）：
 - `DataConsumer`：遍历所有 frame，调用虚函数 handler，入口为 `run()`
 - `DataFetcher`（继承 DataConsumer）：提供 `get_tick_data()`、`get_sh/sz_order_data()`、`get_sh/sz_trade_data()`，按时间范围过滤返回 vector，使用 KungFu 的 `JournalReader` API
 
-**Journal 回放**（`journal_replayer.cpp`）：mmap 读取历史 journal → 跨频道排序 → 通过 Paged 的 JournalWriter 按时间回放写入。支持断点续写（通过 `extra_nano` 记录原始时间戳）。
+**Journal 回放**（`tools/journal_replayer.cpp`）：mmap 读取历史 journal → 跨频道排序 → 通过 Paged 的 JournalWriter 按时间回放写入。支持断点续写（通过 `extra_nano` 记录原始时间戳）。
 
-**实时读取**（`live_reader.cpp`）：通过 `JournalReader::createReaderWithSys()` 经 Paged 实时读取，按 msg_type 分发处理。
+**实时读取**（`tools/live_reader.cpp`）：通过 `JournalReader::createReaderWithSys()` 经 Paged 实时读取，按 msg_type 分发处理。
 
-**交易所判断**（`utils.cpp`）：symbol < 400000 → SZ（深圳），>= 400000 → SH（上海）。
+**交易所判断**（`src/utils.cpp`）：symbol < 400000 → SZ（深圳），>= 400000 → SH（上海）。
 
 ## 关键约定
 
-- `data_struct.hpp` 中所有结构体使用 `__attribute__((packed))`，不可添加 padding 或调整字段顺序
-- `main()` 位于 `data_consumer.cpp` 末尾
+- `src/data_struct.hpp` 中所有结构体使用 `__attribute__((packed))`，不可添加 padding 或调整字段顺序
+- `main()` 位于 `src/data_consumer.cpp` 末尾
 - Journal page header 56 字节，frame header 40 字节，在 `LocalJournalPage` 中硬编码
 - `parse_nano()` 将纳秒时间戳转换为 `HHmmSSmm` 整数格式
 - JournalWriter name 不可超过 30 个字符

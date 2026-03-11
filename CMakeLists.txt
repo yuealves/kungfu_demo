@@ -62,32 +62,32 @@ link_directories("${PROJECT_SOURCE_DIR}/lib/")
 SET(INSIGHT_API ACE ACE_SSL protobuf mdc_gateway_client)
 set(CMAKE_INCLUDE_DIRECTORIES_PROJECT_BEFORE ON)
 
-include_directories("${PROJECT_SOURCE_DIR}"
+include_directories("${PROJECT_SOURCE_DIR}/src"
 	"${PROJECT_SOURCE_DIR}/include"
 	"${PROJECT_SOURCE_DIR}/include/mdc_gateway_client/protobuf"
 	"${PROJECT_SOURCE_DIR}/include/mdc_gateway_client/include"
 	"${PROJECT_SOURCE_DIR}/include/protobuf-3.1.0/include")
 
 ADD_LIBRARY(insight_handle SHARED
-	utils.cpp
-	insight_types.cpp)
+	src/utils.cpp
+	src/insight_types.cpp)
 
 target_link_libraries(insight_handle journal -lpthread python2.7 ${Boost_LIBRARIES} ${INSIGHT_API})
-ADD_LIBRARY(consumer SHARED data_consumer.cpp)
+ADD_LIBRARY(consumer SHARED src/data_consumer.cpp)
 TARGET_LINK_LIBRARIES(consumer insight_handle)
-ADD_EXECUTABLE(data_consumer data_consumer.cpp)
+ADD_EXECUTABLE(data_consumer src/data_consumer.cpp)
 
 TARGET_LINK_LIBRARIES(data_consumer insight_handle)
 
-ADD_EXECUTABLE(journal_replayer journal_replayer.cpp)
+ADD_EXECUTABLE(journal_replayer tools/journal_replayer.cpp)
 TARGET_LINK_LIBRARIES(journal_replayer insight_handle)
 
-ADD_EXECUTABLE(live_reader live_reader.cpp)
+ADD_EXECUTABLE(live_reader tools/live_reader.cpp)
 TARGET_LINK_LIBRARIES(live_reader insight_handle)
 
-ADD_EXECUTABLE(verify_journal_time verify_journal_time.cpp)
+ADD_EXECUTABLE(verify_journal_time tests/verify_journal_time.cpp)
 TARGET_LINK_LIBRARIES(verify_journal_time insight_handle)
 
-
-
+ADD_EXECUTABLE(verify_nanotime tests/verify_nanotime.cpp)
+TARGET_LINK_LIBRARIES(verify_nanotime dl)
 
