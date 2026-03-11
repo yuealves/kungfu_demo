@@ -153,17 +153,41 @@ int main(int argc, char* argv[])
     if (output_dir.back() != '/') output_dir += '/';
     std::string output_path = output_dir + "latency_" + today + ".csv";
     if (interval_sec <= 0) interval_sec = 1;
+    if (!journal_dir.empty() && journal_dir.back() != '/') journal_dir += '/';
 
     using namespace kungfu::yijinjing;
 
-    std::string reader_name = "latency_mon_" + parseNano(getNanoTime(), "%H%M%S");
-
-    std::vector<std::string> dirs = {journal_dir, journal_dir, journal_dir};
     std::vector<std::string> jnames = {
         "insight_stock_tick_data",
         "insight_stock_order_data",
         "insight_stock_trade_data",
     };
+
+    // 等待 journal 文件出现（非交易日 insight_gateway 不会写入，最多等 10 分钟后安全退出）
+    bool journals_exist = false;
+    for (int retry = 0; retry < 60 && !journals_exist && g_running; ++retry) {
+        for (const auto& jn : jnames) {
+            std::string path = journal_dir + "yjj." + jn + ".1.journal";
+            if (access(path.c_str(), F_OK) == 0) {
+                journals_exist = true;
+                break;
+            }
+        }
+        if (!journals_exist) {
+            if (retry == 0) {
+                std::cout << "[monitor] journal files not found, waiting (up to 10 min)..." << std::endl;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+        }
+    }
+    if (!journals_exist) {
+        std::cout << "[monitor] no journal files after 10 min, likely non-trading day, exiting" << std::endl;
+        return 0;
+    }
+
+    std::vector<std::string> dirs = {journal_dir, journal_dir, journal_dir};
+
+    std::string reader_name = "latency_mon_" + parseNano(getNanoTime(), "%H%M%S");
 
     std::cout << "[monitor] reader: " << reader_name << std::endl;
     std::cout << "[monitor] journal dir: " << journal_dir << std::endl;
