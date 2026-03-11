@@ -1,35 +1,66 @@
 /**
- * Live Reader - 通过 Paged 的 createReaderWithSys 实时读取 journal 数据，
- * 模拟线上策略程序接收行情的方式。
+ * Live Reader - 通过 Paged 实时读取 journal 数据
  *
- * 用法: ./live_reader [print_interval]
- *   print_interval: 每隔多少条打印一次详细数据，默认 10000
+ * 每秒打印最新一帧的信息，包含三个时间：
+ *   - exchange_time:  payload 中的交易所行情时间
+ *   - original_time:  原始 journal 的 nano（存于 extra_nano）
+ *   - replay_time:    回放写入时的 nano（frame header nano）
  *
- * 需要 Paged 服务已启动，且有 writer 正在往对应频道写数据。
+ * 用法: ./live_reader
  */
 
 #include "JournalReader.h"
 #include "Timer.h"
 #include "data_struct.hpp"
-#include "insight_types.h"
 #include "sys_messages.h"
 #include "utils.h"
 
 #include <iostream>
+#include <iomanip>
 #include <chrono>
 #include <thread>
 #include <csignal>
 #include <atomic>
+#include <ctime>
 
 static std::atomic<bool> g_running{true};
 static void signal_handler(int) { g_running = false; }
 
+// 纳秒时间戳 → "HH:MM:SS.mmm" (UTC+8)
+static std::string nano_to_str(long nano) {
+    if (nano <= 0) return "N/A";
+    time_t sec = nano / 1000000000L;
+    int ms = (nano % 1000000000L) / 1000000;
+    struct tm t;
+    localtime_r(&sec, &t);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d", t.tm_hour, t.tm_min, t.tm_sec, ms);
+    return buf;
+}
+
+// 交易所时间 int (HHMMSSmmm) → "HH:MM:SS.mmm"
+static std::string exchange_time_to_str(int t) {
+    if (t <= 0) return "N/A";
+    int ms  = t % 1000;    t /= 1000;
+    int sec = t % 100;     t /= 100;
+    int min = t % 100;     t /= 100;
+    int hour = t;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d", hour, min, sec, ms);
+    return buf;
+}
+
+static const char* msg_type_name(short msg_type) {
+    switch (msg_type) {
+        case MSG_TYPE_L2_TICK:  return "TICK";
+        case MSG_TYPE_L2_ORDER: return "ORDER";
+        case MSG_TYPE_L2_TRADE: return "TRADE";
+        default:                return "OTHER";
+    }
+}
+
 int main(int argc, const char* argv[])
 {
-    int print_interval = 10000;
-    if (argc > 1) print_interval = std::atoi(argv[1]);
-    if (print_interval <= 0) print_interval = 10000;
-
     using namespace kungfu::yijinjing;
 
     std::string journal_dir = "/shared/kungfu/journal/user/";
@@ -43,11 +74,8 @@ int main(int argc, const char* argv[])
     };
 
     std::cout << "[init] reader: " << reader_name << std::endl;
-    std::cout << "[init] journal dir: " << journal_dir << std::endl;
-    std::cout << "[init] print interval: " << print_interval << std::endl;
 
-    // 通过 Paged 创建 reader（ClientPageProvider），从当前时间开始读
-    long start_time = 0;  // TIME_FROM_FIRST: 从头开始读
+    long start_time = 0;
     JournalReaderPtr reader = JournalReader::createReaderWithSys(
         dirs, jnames, start_time, reader_name);
 
@@ -56,96 +84,100 @@ int main(int argc, const char* argv[])
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    long tick_count = 0;
-    long order_count = 0;
-    long trade_count = 0;
-    long sys_count = 0;
-    long other_count = 0;
+    // 每种消息类型分别记录最新帧信息和计数
+    struct ChannelState {
+        const char* name;
+        const char* count_label;
+        long  count = 0;
+        long  nano = 0;          // replay time (frame header nano)
+        long  extra_nano = 0;    // original time
+        int   exchange_time = 0;
+        int   symbol = 0;
+    };
+    ChannelState ch[3] = {{"TICK", "tick_count"}, {"ORDER", "order_count"}, {"TRADE", "trade_count"}};
 
-    auto last_report = std::chrono::steady_clock::now();
+    auto last_print = std::chrono::steady_clock::now();
     long last_total = 0;
 
     while (g_running) {
         FramePtr frame = reader->getNextFrame();
 
         if (frame.get() == nullptr) {
-            // 没有新数据，短暂休眠避免空转
+            // 没有新数据时，检查是否该打印
+            auto now = std::chrono::steady_clock::now();
+            long total = ch[0].count + ch[1].count + ch[2].count;
+            if (total > last_total &&
+                std::chrono::duration_cast<std::chrono::seconds>(now - last_print).count() >= 1) {
+                for (auto& c : ch) {
+                    if (c.count == 0) continue;
+                    std::cout << "[" << std::setw(5) << std::left << c.name << "]"
+                              << " symbol=" << std::setw(6) << std::setfill('0') << std::right << c.symbol << std::setfill(' ')
+                              << " | exchange=" << exchange_time_to_str(c.exchange_time)
+                              << " | original=" << nano_to_str(c.extra_nano)
+                              << " | replay=" << nano_to_str(c.nano)
+                              << " | " << c.count_label << "=" << c.count
+                              << std::endl;
+                }
+                std::cout << std::endl;
+                last_print = now;
+                last_total = total;
+            }
             std::this_thread::sleep_for(std::chrono::microseconds(100));
             continue;
         }
 
         short msg_type = frame->getMsgType();
-        long nano = frame->getNano();
         void* data = frame->getData();
 
-        if (msg_type == MSG_TYPE_L2_TICK) {
-            tick_count++;
-            if (tick_count % print_interval == 1) {
-                KyStdSnpType* md = (KyStdSnpType*)data;
-                int host_time = parse_nano(nano);
-                L2StockTickDataField l2_tick = trans_tick(*md, host_time);
-                std::cout << "[TICK #" << tick_count << "] " << l2_tick.to_string() << std::endl;
-            }
-        }
-        else if (msg_type == MSG_TYPE_L2_ORDER) {
-            order_count++;
-            if (order_count % print_interval == 1) {
-                KyStdOrderType* md = (KyStdOrderType*)data;
-                int host_time = parse_nano(nano);
-                std::string exchange = decode_exchange(md->Symbol);
-                auto l2_order = trans_order(*md, host_time, exchange);
-                auto res = std::visit([](const auto& field) {
-                    return field.to_string();
-                }, l2_order);
-                std::cout << "[ORDER #" << order_count << "] " << res << std::endl;
-            }
-        }
-        else if (msg_type == MSG_TYPE_L2_TRADE) {
-            trade_count++;
-            if (trade_count % print_interval == 1) {
-                KyStdTradeType* md = (KyStdTradeType*)data;
-                int host_time = parse_nano(nano);
-                std::string exchange = decode_exchange(md->Symbol);
-                auto l2_trade = trans_trade(*md, host_time, exchange);
-                auto res = std::visit([](const auto& field) {
-                    return field.to_string();
-                }, l2_trade);
-                std::cout << "[TRADE #" << trade_count << "] " << res << std::endl;
-            }
-        }
-        else if (msg_type == MSG_TYPE_PAGED_START || msg_type == MSG_TYPE_PAGED_END) {
-            sys_count++;
-            std::cout << "[SYS] msg_type=" << msg_type
-                      << (msg_type == MSG_TYPE_PAGED_START ? " (PAGED_START)" : " (PAGED_END)")
-                      << std::endl;
-        }
-        else {
-            other_count++;
+        int idx = -1;
+        if (msg_type == MSG_TYPE_L2_TICK)       idx = 0;
+        else if (msg_type == MSG_TYPE_L2_ORDER) idx = 1;
+        else if (msg_type == MSG_TYPE_L2_TRADE) idx = 2;
+        if (idx < 0) continue;
+
+        auto& c = ch[idx];
+        c.count++;
+        c.nano = frame->getNano();
+        c.extra_nano = frame->getExtraNano();
+
+        if (idx == 0) {
+            auto* md = (KyStdSnpType*)data;
+            c.exchange_time = md->Time;
+            c.symbol = md->Symbol;
+        } else if (idx == 1) {
+            auto* md = (KyStdOrderType*)data;
+            c.exchange_time = md->Time;
+            c.symbol = md->Symbol;
+        } else {
+            auto* md = (KyStdTradeType*)data;
+            c.exchange_time = md->Time;
+            c.symbol = md->Symbol;
         }
 
-        // 每 3 秒打印一次统计
+        // 每秒打印一次
         auto now = std::chrono::steady_clock::now();
-        long total = tick_count + order_count + trade_count;
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 3 && total > last_total) {
-            long delta = total - last_total;
-            std::cout << "[stats] tick=" << tick_count
-                      << " order=" << order_count
-                      << " trade=" << trade_count
-                      << " | +" << delta << " frames in 3s"
-                      << " | time=" << parseNano(nano, "%H:%M:%S")
-                      << std::endl;
-            last_report = now;
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_print).count() >= 1) {
+            long total = ch[0].count + ch[1].count + ch[2].count;
+            for (auto& c : ch) {
+                if (c.count == 0) continue;
+                std::cout << "[" << std::setw(5) << std::left << c.name << "]"
+                          << " symbol=" << std::setw(6) << std::setfill('0') << std::right << c.symbol << std::setfill(' ')
+                          << " | exchange=" << exchange_time_to_str(c.exchange_time)
+                          << " | original=" << nano_to_str(c.extra_nano)
+                          << " | replay=" << nano_to_str(c.nano)
+                          << " | " << c.count_label << "=" << c.count
+                          << std::endl;
+            }
+            std::cout << std::endl;
+            last_print = now;
             last_total = total;
         }
     }
 
-    std::cout << "\n[done] === Summary ===" << std::endl;
-    std::cout << "  tick:  " << tick_count << std::endl;
-    std::cout << "  order: " << order_count << std::endl;
-    std::cout << "  trade: " << trade_count << std::endl;
-    std::cout << "  sys:   " << sys_count << std::endl;
-    if (other_count > 0)
-        std::cout << "  other: " << other_count << std::endl;
+    std::cout << "\n[done] tick=" << ch[0].count
+              << " order=" << ch[1].count
+              << " trade=" << ch[2].count
+              << std::endl;
 
     return 0;
 }

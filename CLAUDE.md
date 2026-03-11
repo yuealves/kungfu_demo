@@ -38,12 +38,25 @@ journal 文件路径由 CMake 宏 `PROJECT_ROOT_DIR` 设定，在 `src/data_cons
 
 ### 本地模拟回放
 
+推荐使用 `scripts/replay` 管理脚本（详见 `docs/replay_guide.md`）：
+
 ```bash
-scripts/run_all.sh          # 一键启动 Paged → replayer → reader
+scripts/replay start 10          # 启动 Paged + replayer 后台运行（10 倍速）
+scripts/replay stop              # 停止 replayer（Paged 保留，reader 可重连）
+scripts/replay start 10          # 断点续播
+scripts/replay start --reset 10  # 从头开始
+scripts/replay status            # 查看运行状态
+scripts/replay clean             # 停止所有服务 + 清理 journal
+```
+
+底层脚本（`replay` 内部调用，一般不需要直接使用）：
+
+```bash
 scripts/start_paged.sh      # 单独启动 Paged
-scripts/start_replayer.sh   # 单独启动 replayer
-scripts/start_reader.sh     # 单独启动 reader
 scripts/stop_paged.sh       # 停止 Paged
+scripts/start_replayer.sh   # 前台启动 replayer
+scripts/start_reader.sh     # 前台启动 reader
+scripts/run_all.sh          # 一键前台启动 Paged → reader → replayer
 ```
 
 ## 架构

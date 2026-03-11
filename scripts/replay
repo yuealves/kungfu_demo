@@ -1,0 +1,176 @@
+#!/bin/bash
+# scripts/replay — replayer + Paged 生命周期管理
+#
+# 用法:
+#   replay start [--reset] [speed]   启动 Paged + replayer 后台运行
+#   replay stop                      停止 replayer（保留 Paged）
+#   replay status                    显示 Paged 和 replayer 运行状态
+#   replay clean                     停止 replayer + Paged + 清理所有残留
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+BUILD_DIR="$PROJECT_DIR/build"
+PID_FILE="$BUILD_DIR/replayer.pid"
+LOG_FILE="$BUILD_DIR/replayer.log"
+BINARY="$BUILD_DIR/journal_replayer"
+
+PAGED_SOCK="/shared/kungfu/socket/paged.sock"
+PAGED_PID_FILE="/shared/kungfu/pid/paged.pid"
+JOURNAL_PATTERN="/shared/kungfu/journal/user/yjj.insight_stock_*"
+
+# ── helpers ──────────────────────────────────────────────
+
+is_replayer_running() {
+    [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+is_paged_running() {
+    [ -S "$PAGED_SOCK" ] && [ -f "$PAGED_PID_FILE" ] && kill -0 "$(cat "$PAGED_PID_FILE")" 2>/dev/null
+}
+
+stop_replayer() {
+    if is_replayer_running; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        echo "[replay] stopping replayer (pid=$pid)..."
+        kill "$pid" 2>/dev/null || true
+        # wait up to 3s for graceful exit
+        for _ in $(seq 1 6); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "[replay] force killing replayer..."
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PID_FILE"
+        echo "[replay] replayer stopped"
+    else
+        rm -f "$PID_FILE"
+        echo "[replay] replayer not running"
+    fi
+}
+
+ensure_paged() {
+    if is_paged_running; then
+        echo "[replay] Paged already running (pid=$(cat "$PAGED_PID_FILE"))"
+    else
+        echo "[replay] starting Paged..."
+        bash "$SCRIPT_DIR/start_paged.sh"
+    fi
+}
+
+# ── start ────────────────────────────────────────────────
+
+cmd_start() {
+    local reset=0
+    local speed=1
+
+    # parse args
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --reset) reset=1; shift ;;
+            *)       speed="$1"; shift ;;
+        esac
+    done
+
+    # check if already running
+    if is_replayer_running; then
+        echo "[replay] replayer already running (pid=$(cat "$PID_FILE"))"
+        echo "[replay] use 'replay stop' first, or 'replay status' to check"
+        exit 1
+    fi
+    rm -f "$PID_FILE"
+
+    # ensure Paged is up
+    ensure_paged
+
+    # --reset: clean target journals so replayer starts from beginning
+    if [ "$reset" -eq 1 ]; then
+        echo "[replay] --reset: cleaning target journals..."
+        rm -f $JOURNAL_PATTERN
+        echo "[replay] will start from beginning"
+    else
+        echo "[replay] resuming from last position (use --reset to start over)"
+    fi
+
+    # check binary exists
+    if [ ! -f "$BINARY" ]; then
+        echo "[replay] ERROR: binary not found: $BINARY"
+        echo "[replay] run: cd build && cmake .. && make journal_replayer"
+        exit 1
+    fi
+
+    # launch replayer in background
+    export LD_LIBRARY_PATH=/opt/kungfu/master/lib/yijinjing:/opt/kungfu/master/lib/boost:$PROJECT_DIR/lib
+    cd "$BUILD_DIR"
+    nohup ./journal_replayer "$speed" > "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+
+    echo "[replay] replayer started (pid=$(cat "$PID_FILE"), speed=${speed}x)"
+    echo "[replay] log: $LOG_FILE"
+}
+
+# ── stop ─────────────────────────────────────────────────
+
+cmd_stop() {
+    stop_replayer
+    echo "[replay] Paged left running — readers can still connect"
+}
+
+# ── status ───────────────────────────────────────────────
+
+cmd_status() {
+    echo "=== Paged ==="
+    if is_paged_running; then
+        echo "  running (pid=$(cat "$PAGED_PID_FILE"))"
+    else
+        echo "  not running"
+    fi
+
+    echo ""
+    echo "=== Replayer ==="
+    if is_replayer_running; then
+        echo "  running (pid=$(cat "$PID_FILE"))"
+    else
+        echo "  not running"
+    fi
+
+    if [ -f "$LOG_FILE" ]; then
+        echo ""
+        echo "=== Last 10 lines of replayer.log ==="
+        tail -10 "$LOG_FILE"
+    fi
+}
+
+# ── clean ────────────────────────────────────────────────
+
+cmd_clean() {
+    stop_replayer
+    echo "[replay] stopping Paged..."
+    bash "$SCRIPT_DIR/stop_paged.sh"
+    echo "[replay] cleaning target journals..."
+    rm -f $JOURNAL_PATTERN
+    echo "[replay] clean done"
+}
+
+# ── main ─────────────────────────────────────────────────
+
+case "${1:-}" in
+    start)  shift; cmd_start "$@" ;;
+    stop)   cmd_stop ;;
+    status) cmd_status ;;
+    clean)  cmd_clean ;;
+    *)
+        echo "Usage: replay {start|stop|status|clean}"
+        echo ""
+        echo "Commands:"
+        echo "  start [--reset] [speed]  Start Paged + replayer (default speed=1)"
+        echo "  stop                     Stop replayer (keep Paged running)"
+        echo "  status                   Show Paged and replayer status"
+        echo "  clean                    Stop everything + clean journals"
+        exit 1
+        ;;
+esac
