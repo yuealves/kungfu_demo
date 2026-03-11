@@ -6,7 +6,7 @@
 
 本项目属于盖亚青柯量化私募的流式因子计算系统。
 
-**线上架构**：托管机上运行 `market_gateway`（代码位于 `market_gateway_test/market_gateway/`），负责：
+**线上架构**：托管机上运行 `market_gateway`（代码位于 `ht_insight_market_gateway/insight_market_gateway/`），负责：
 1. 读取华泰 Insight 实时 L2 行情数据
 2. 转换为 KungFu journal 格式写入 journal 文件
 3. 通过 KungFu yjj 启动 Paged 服务，允许其他进程以 mmap 方式实时读取 journal
