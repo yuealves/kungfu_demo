@@ -799,6 +799,118 @@ echo "--- Journal 文件检查 ---"
 ls -lt /shared/kungfu/journal/user/ | head -5
 ```
 
+### 8.6 实战案例：2026-03-11 Paged 重启（替换 libjournal.so 修复 getNanoTime bug）
+
+**背景**：`getNanoTime()` 存在 ~750ms 时钟偏移 bug，需要替换 `libjournal.so.1.1` 并重启 Paged 使新 .so 生效。操作在收盘后进行。
+
+**Step 1: 确认环境安全**
+
+```bash
+ps -ef | grep -E 'insight_gateway|data_fetcher' | grep -v grep
+# 确认无活跃业务进程，只有 Paged 在运行
+```
+
+**Step 2: 查看 supervisord 中 Paged 的程序名**
+
+```bash
+supervisorctl -c /opt/kungfu/master/etc/supervisor/supervisord.conf status
+# md_ctp      STOPPED
+# md_xtp      STOPPED
+# td_ctp      STOPPED
+# td_xtp      STOPPED
+# yijinjing   RUNNING   pid 3230, uptime 40 days, 0:50:17
+```
+
+Paged 在 supervisord 里的名字是 **`yijinjing`**。
+
+**Step 3: 备份并替换 .so**
+
+```bash
+cp /opt/kungfu/master/lib/yijinjing/libjournal.so.1.1{,.bak}
+cp /root/lw_dev/libjournal.so.1.1 /opt/kungfu/master/lib/yijinjing/libjournal.so.1.1
+```
+
+**Step 4: 重启 Paged — 第一次失败**
+
+```bash
+supervisorctl -c /opt/kungfu/master/etc/supervisor/supervisord.conf restart yijinjing
+# yijinjing: stopped
+# yijinjing: ERROR (abnormal termination)
+```
+
+**Step 5: 排查原因**
+
+```bash
+tail /shared/kungfu/log/page_engine.log
+# PageEngine Caught signal: 15  (SIGTERM — 正常停止信号)
+# PageEngine Caught signal: 11  (SIGSEGV — 段错误！)
+# PageEngine Caught signal: 6   (SIGABRT)
+```
+
+Paged 在关闭过程中崩溃（SIGSEGV），残留的 pid/socket 文件阻止了新实例启动。
+
+**Step 6: 清理残留文件，重新启动 — 成功**
+
+```bash
+rm -f /shared/kungfu/pid/paged.pid \
+      /shared/kungfu/socket/paged.sock \
+      /shared/kungfu/socket/paged_rconsole.sock
+
+supervisorctl -c /opt/kungfu/master/etc/supervisor/supervisord.conf start yijinjing
+# yijinjing: started
+```
+
+**Step 7: 清理孤儿进程**
+
+`restart` 只 kill 了父进程（PID 3230），旧 worker（PID 3231, 99% CPU）变成孤儿进程，SIGTERM 无效，需要 `kill -9`：
+
+```bash
+kill -9 3231 3128 3129 3130
+```
+
+> 注意：PID 3229（supervisord 本身）必须保留。
+
+**Step 8: 验证**
+
+```bash
+supervisorctl -c /opt/kungfu/master/etc/supervisor/supervisord.conf status yijinjing
+# yijinjing  RUNNING  pid 34338, uptime 0:00:20
+
+LD_LIBRARY_PATH=/root/lw_dev:/opt/kungfu/toolchain/boost-1.62.0/lib ./verify_nanotime
+# ALL PASS, max diff = -770 ns
+```
+
+**次日确认（3/12 开盘）**：所有服务通过 cron 正常拉起，latency CSV 确认 journal_time 与 exchange_time 偏差已在正常范围。
+
+**教训总结**：
+
+1. `supervisorctl restart` 不可靠 — Paged 关闭时可能 SIGSEGV，留下残留文件导致新实例启动失败
+2. 推荐操作顺序：**stop → 清理残留 → kill 孤儿进程 → start**，不要用 `restart`
+3. 旧 worker 进程可能忽略 SIGTERM，必须 `kill -9`
+
+**推荐的 Paged 重启步骤（精简版）**：
+
+```bash
+# 1. 停止
+supervisorctl -c /opt/kungfu/master/etc/supervisor/supervisord.conf stop yijinjing
+
+# 2. 清理残留
+rm -f /shared/kungfu/pid/paged.pid \
+      /shared/kungfu/socket/paged.sock \
+      /shared/kungfu/socket/paged_rconsole.sock
+
+# 3. 杀孤儿 worker
+ps -ef | grep 'yjj server' | grep -v grep
+# 如有残留: kill -9 <pid>
+
+# 4. 启动
+supervisorctl -c /opt/kungfu/master/etc/supervisor/supervisord.conf start yijinjing
+
+# 5. 验证
+supervisorctl -c /opt/kungfu/master/etc/supervisor/supervisord.conf status yijinjing
+file /shared/kungfu/socket/paged.sock   # 应输出: socket
+```
+
 ---
 
 ## 9. 配置参考
