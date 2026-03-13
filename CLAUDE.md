@@ -16,7 +16,7 @@
 
 **本地模拟环境**：`journal_replayer` 读取历史 journal 数据，通过 Paged 回放，模拟线上 `market_gateway` 的写入行为；`live_reader` 通过 Paged 实时读取，模拟下游消费者。
 
-关于 KungFu journal 系统的详细说明见 `docs/journal_data_write_read.md`。
+关于 KungFu journal 系统的详细说明见 `docs/L2行情数据与Journal系统.md`。
 
 ## 编译
 

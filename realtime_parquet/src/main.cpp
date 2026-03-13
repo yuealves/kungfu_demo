@@ -69,9 +69,29 @@ static void mkdir_p(const std::string& path) {
 }
 
 static void print_usage(const char* prog) {
-    std::cerr << "Usage: " << prog << " [-o output_dir] [-d journal_dir]" << std::endl;
+    std::cerr << "Usage: " << prog << " [-o output_dir] [-d journal_dir] [-s now]" << std::endl;
     std::cerr << "  -o  Output directory (default: ./output)" << std::endl;
     std::cerr << "  -d  Journal directory (default: /shared/kungfu/journal/user/)" << std::endl;
+    std::cerr << "  -s  Start mode: 'now' = only new data, default = from journal start" << std::endl;
+}
+
+// 将 nano 时间戳中的时间部分转换为当天零点以来的毫秒数
+static int64_t nano_to_ms_of_day(int64_t nano) {
+    time_t sec = nano / 1000000000LL;
+    struct tm t;
+    localtime_r(&sec, &t);
+    int64_t ms = t.tm_hour * 3600000LL + t.tm_min * 60000LL + t.tm_sec * 1000LL
+               + (nano % 1000000000LL) / 1000000LL;
+    return ms;
+}
+
+// 将 exchange_time (HHMMSSmmm) 转换为当天零点以来的毫秒数
+static int64_t exch_time_to_ms_of_day(int32_t exch_time) {
+    int mmm = exch_time % 1000;
+    int ss  = (exch_time / 1000) % 100;
+    int mm  = (exch_time / 100000) % 100;
+    int hh  = exch_time / 10000000;
+    return hh * 3600000LL + mm * 60000LL + ss * 1000LL + mmm;
 }
 
 // 每种消息类型独立追踪分钟，避免 tick/order/trade 交织导致反复切换
@@ -80,6 +100,10 @@ struct ChannelCtx {
     MinuteWriter writer;
     int current_minute = -1;
     long total_rows = 0;
+    int64_t last_nano = 0;        // 最后一条数据的 nano_timestamp（线上=getNano, replay=extra_nano）
+    int64_t last_read_wall = 0;   // 读到最后一条数据时的墙上时间
+    int32_t last_exch_time = 0;   // 最后一条数据的 exchange_time (HHMMSSmmm)
+    int32_t last_symbol = 0;      // 最后一条数据的股票代码
 
     ChannelCtx(const char* n, MinuteWriter::Type t) : name(n), writer(t) {}
 };
@@ -90,6 +114,7 @@ int main(int argc, const char* argv[])
 
     std::string output_dir = "./output";
     std::string journal_dir = "/shared/kungfu/journal/user/";
+    bool start_from_now = false;
 
     // 简单参数解析
     for (int i = 1; i < argc; ++i) {
@@ -98,6 +123,14 @@ int main(int argc, const char* argv[])
             output_dir = argv[++i];
         } else if (arg == "-d" && i + 1 < argc) {
             journal_dir = argv[++i];
+        } else if (arg == "-s" && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "now") {
+                start_from_now = true;
+            } else {
+                std::cerr << "Unknown start mode: " << mode << " (use 'now')" << std::endl;
+                return 1;
+            }
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             return 0;
@@ -114,11 +147,13 @@ int main(int argc, const char* argv[])
         "insight_stock_trade_data",
     };
 
+    long start_time = start_from_now ? getNanoTime() : 0;
+
     std::cout << "[init] reader: " << reader_name << std::endl;
     std::cout << "[init] journal: " << journal_dir << std::endl;
     std::cout << "[init] output:  " << output_dir << std::endl;
+    std::cout << "[init] start:   " << (start_from_now ? "now (skip history)" : "beginning") << std::endl;
 
-    long start_time = 0;
     JournalReaderPtr reader = JournalReader::createReaderWithSys(
         dirs, jnames, start_time, reader_name);
 
@@ -150,16 +185,45 @@ int main(int argc, const char* argv[])
     auto rotate_channel = [&](ChannelCtx& ch, int minute, int64_t nano) {
         // 关闭当前文件
         if (ch.current_minute >= 0) {
-            auto t0 = std::chrono::steady_clock::now();
             ch.writer.close();
-            auto t1 = std::chrono::steady_clock::now();
-            auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+            // 落盘完成的墙上时间
+            int64_t now_ns = getNanoTime();
+
+            // L1: gateway 延迟 = nano_timestamp - exchange_time（journal 写入相对交易所时间的延迟）
+            int64_t gateway_ms = nano_to_ms_of_day(ch.last_nano)
+                               - exch_time_to_ms_of_day(ch.last_exch_time);
+
+            // L2: 落盘延迟 = wall_clock_now - 读到最后一条数据的墙上时间
+            //   实盘: 读到时刻 ≈ journal 写入时刻（mmap 轮询延迟可忽略）
+            //   replay: 读到时刻 = realtime_parquet 实际处理的时间点
+            int64_t disk_ms = (now_ns - ch.last_read_wall) / 1000000LL;
+
+            // 格式化 nano 为 HH:MM:SS.mmm
+            time_t last_sec = ch.last_nano / 1000000000LL;
+            struct tm last_tm;
+            localtime_r(&last_sec, &last_tm);
+            int last_ms = (ch.last_nano % 1000000000LL) / 1000000;
+
+            // 格式化 exchange_time (HHMMSSmmm) 为 HH:MM:SS.mmm
+            int et = ch.last_exch_time;
+            int et_h = et / 10000000, et_m = (et / 100000) % 100;
+            int et_s = (et / 1000) % 100, et_ms = et % 1000;
 
             char ms[8];
             snprintf(ms, sizeof(ms), "%04d", ch.current_minute);
+            char nano_str[16], exch_str[16];
+            snprintf(nano_str, sizeof(nano_str), "%02d:%02d:%02d.%03d",
+                     last_tm.tm_hour, last_tm.tm_min, last_tm.tm_sec, last_ms);
+            snprintf(exch_str, sizeof(exch_str), "%02d:%02d:%02d.%03d",
+                     et_h, et_m, et_s, et_ms);
+
             std::cout << "[flush] " << ch.name << " " << ms
-                      << " latency=" << latency_ms << "ms"
                       << " rows=" << ch.writer.row_count()
+                      << " last=" << ch.last_symbol
+                      << " nano=" << nano_str
+                      << " exch=" << exch_str
+                      << " gw=" << gateway_ms << "ms"
+                      << " disk=" << disk_ms << "ms"
                       << std::endl;
 
             ch.total_rows += ch.writer.row_count();
@@ -207,13 +271,24 @@ int main(int argc, const char* argv[])
             rotate_channel(ch, minute, nano);
         }
 
-        // 写入数据
+        // 写入数据，同时追踪最后一条数据的时间戳
+        ch.last_nano = nano;
+        ch.last_read_wall = getNanoTime();
         if (idx == 0) {
-            ch.writer.append_tick((KyStdSnpType*)data, nano);
+            auto* md = (KyStdSnpType*)data;
+            ch.last_exch_time = md->Time;
+            ch.last_symbol = md->Symbol;
+            ch.writer.append_tick(md, nano);
         } else if (idx == 1) {
-            ch.writer.append_order((KyStdOrderType*)data, nano);
+            auto* md = (KyStdOrderType*)data;
+            ch.last_exch_time = md->Time;
+            ch.last_symbol = md->Symbol;
+            ch.writer.append_order(md, nano);
         } else {
-            ch.writer.append_trade((KyStdTradeType*)data, nano);
+            auto* md = (KyStdTradeType*)data;
+            ch.last_exch_time = md->Time;
+            ch.last_symbol = md->Symbol;
+            ch.writer.append_trade(md, nano);
         }
     }
 

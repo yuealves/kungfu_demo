@@ -20,7 +20,7 @@
 
 4. **数据结构**：梳理了两层数据模型——KungFu 原始 packed 结构（`KyStdSnpType`/`KyStdOrderType`/`KyStdTradeType`）和转换后的 L2 标准结构（`L2StockTickDataField`/`SH_SZ_StockStepOrderField`/`SH_SZ_StockStepTradeField`），以及 `trans_tick()`/`trans_order()`/`trans_trade()` 转换函数
 
-详细文档：`docs/journal_data_write_read.md`
+详细文档：`docs/L2行情数据与Journal系统.md`
 
 ### 2. 本地模拟环境搭建
 

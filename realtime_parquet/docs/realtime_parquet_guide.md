@@ -21,7 +21,7 @@ Paged (mmap)
 │    buffer → 满 ROW_GROUP_SIZE → WriteTable    │
 │    (Row Group 预压缩，不等分钟边界)            │
 │                                              │
-│  检测分钟切换 (exchange_time 变化):            │
+│  检测分钟切换 (nano_timestamp 变化):            │
 │    flush 残余 buffer → Close → 打印延迟       │
 │    Open 新文件 → 继续                         │
 └─────────────────────────────────────────────┘
@@ -43,11 +43,16 @@ output_dir/YYYYMMDD/
 
 到分钟边界时只需 flush 最后一批不完整的 Row Group + 写 footer + close 文件，延迟极低（通常 < 20ms）。
 
-### 独立通道 + 只向前推进
+### 基于 nano_timestamp 切分钟
 
-tick/order/trade 三个通道各自独立追踪分钟。从 Paged 读取时三种消息交织到达，exchange_time 可能跨分钟乱序（尤其是 order 数据，集合竞价 0915 的委托散布在整段开盘前数据中）。
+分钟切换依据 **nano_timestamp**（journal 帧时间戳）而非 exchange_time：
 
-每个通道只在 exchange_time 的分钟**向前推进**时才触发文件切换，回退的旧时间数据直接写入当前文件。这避免了频繁 close/open 导致的性能问题和大量碎片文件。
+- **线上**：`nano = frame->getNano()`（写入 journal 的墙上时间）
+- **replay**：`nano = frame->getExtraNano()`（原始历史时间戳）
+
+nano_timestamp 严格递增（单线程写入 journal 保证），不存在乱序问题。exchange_time 因交易所多 channel 并行分发 + gateway 多线程入队，跨 channel 会乱序（详见 `docs/行情数据链路与乱序分析.md`）。
+
+文件名和目录日期均从 nano 提取。文件内容可能包含不同 exchange_time 的数据（如 SH 集合竞价 order 在 09:25 一次性到达，exchTime 横跨 09:15~09:24）。
 
 ## 首次部署
 
@@ -75,7 +80,10 @@ cmake .. && make -j$(nproc)
 ### 3. 运行
 
 ```bash
-# 线上（Paged 已在运行，journal 在默认路径）
+# 线上推荐：只处理新数据（跳过 journal 中已有的历史存量）
+./build/realtime_parquet -o /data/rt_parquet -s now
+
+# 从 journal 开头处理所有数据（本地 replay 测试用）
 ./build/realtime_parquet -o /data/rt_parquet
 
 # 指定 journal 目录
@@ -85,35 +93,43 @@ cmake .. && make -j$(nproc)
 参数：
 - `-o output_dir`：输出目录（默认 `./output`）
 - `-d journal_dir`：journal 目录（默认 `/shared/kungfu/journal/user/`）
+- `-s now`：从当前时间开始，跳过 journal 中的历史数据（线上推荐）
 - `-h`：显示帮助
+
+> **线上部署建议使用 `-s now`**：如果 gateway 已经运行了一段时间（journal 中有大量存量数据），不加 `-s now` 会全速追赶所有历史数据，瞬间占满 CPU 和磁盘 I/O。`-s now` 让 reader 的 `jumpStart` 跳到当前时间，只处理之后的新数据���
 
 ## 配合 replay 脚本测试
 
 ```bash
-# 1. 编译
+# 1. 编译（在 realtime_parquet/ 目录下）
 cd kungfu_demo/realtime_parquet
 mkdir -p build && cd build && cmake .. && make -j$(nproc)
 
-# 2. 启动 replay 环境（在 kungfu_demo/ 目录下）
+# 2. 启动 replay（在 kungfu_demo/ 目录下）
 cd kungfu_demo
-./scripts/replay start --reset 10
+./scripts/replay start 5              # 5 倍速，断点续播
+# 或
+./scripts/replay start --reset 5      # 从头开始
 
-# 3. 运行 realtime_parquet
+# 3. 等几秒让 replay 开始写入数据，再启动 realtime_parquet
+sleep 3
 ./realtime_parquet/build/realtime_parquet -o /tmp/rt_parquet
 
-# 4. 观察输出，关注 flush 延迟
-# [flush] 0930 latency=12ms tick=92341 order=958123 trade=769045
-# [flush] 0931 latency=8ms  tick=91200 order=945000 trade=760000
+# 4. 观察输出，关注延迟指标
+# [dir] /tmp/rt_parquet/20260304                                          ← 目录名是数据的实际日期
+# [flush] tick 0930 rows=89157 last=300118 nano=09:30:59.999 exch=09:30:51.000 gw=8999ms disk=35ms
+# [flush] tick 0931 rows=95445 last=2757   nano=09:31:59.979 exch=09:31:45.000 gw=14979ms disk=28ms
 
 # 5. Ctrl+C 停止 realtime_parquet
 
-# 6. 检查输出文件
-ls /tmp/rt_parquet/$(date +%Y%m%d)/
+# 6. 检查输出文件（注意目录名是数据日期，不是今天日期）
+ls /tmp/rt_parquet/
 
 # 7. 用 Python 验证 parquet 可读
 python3 -c "
-import pyarrow.parquet as pq
-t = pq.read_table('/tmp/rt_parquet/$(date +%Y%m%d)/tick_0930.parquet')
+import pyarrow.parquet as pq, os
+data_dir = os.listdir('/tmp/rt_parquet/')[0]
+t = pq.read_table(f'/tmp/rt_parquet/{data_dir}/tick_0930.parquet')
 print(t.schema)
 print(f'rows: {len(t)}')
 "
@@ -121,6 +137,9 @@ print(f'rows: {len(t)}')
 # 8. 停止 replay
 ./scripts/replay stop
 ```
+
+> **注意**：replay 模式下目录名是历史数据的日期（如 `20260304`），不是本机当前日期。
+> 这是因为分钟切换和日期都从 `extra_nano`（原始 journal 时间戳）提取。
 
 ## 打包部署
 
@@ -165,8 +184,8 @@ bash setup_parquet.sh
 mkdir -p build && cd build
 cmake .. && make -j$(nproc)
 
-# 5. 运行
-./realtime_parquet -o /data/rt_parquet
+# 5. 运行（线上推荐 -s now 跳过存量数据）
+./realtime_parquet -o /data/rt_parquet -s now
 ```
 
 ## 输出文件格式
@@ -181,8 +200,8 @@ output_dir/
     └── trade_HHMM.parquet
 ```
 
-- YYYYMMDD：程序运行时的日期
-- HHMM：从 exchange_time 提取的分钟（如 0930 = 09:30）
+- YYYYMMDD：从 nano_timestamp 提取的日期（线上=当天，replay=历史数据日期）
+- HHMM：从 nano_timestamp 提取的分钟（如 0930 = 数据在 09:30 到达）
 
 ### Parquet schema
 
@@ -207,22 +226,91 @@ output_dir/
 - `BSFlag`, `FunctionCode`, `OrderKind` (int8)
 - `BizIndex`, `Channel`, `Index`, `Time`, `Volume` (int32), `Price` (float32)
 
-### 压缩
+### 压缩与线程
+
 - 算法：Snappy
 - Row Group 大小：50000 行
 - Arrow writer 开启多线程列写入 (`use_threads=true`)
 
+**线程模型**：主循环是单线程（读 journal → 分发 → append → 分钟切换）。唯一的多线程来自 Arrow 内部——`use_threads=true` 让 `WriteTable` 时 Arrow 用全局线程池并行编码/压缩不同列。默认线程池大小 = CPU 核心数（`std::thread::hardware_concurrency()`），仅在写 Row Group 的瞬间（几毫秒）占用，不是持续占用。如果线上担心 CPU 资源，可通过环境变量限制：
+
+```bash
+OMP_NUM_THREADS=4 ./realtime_parquet -o /data/rt_parquet -s now
+```
+
+## 实时读取 Parquet 文件
+
+### 当前正在写入的文件
+
+realtime_parquet 进程运行期间，**当前分钟的 parquet 文件尚未完成**——Row Group 数据已写盘，但 footer 和结尾 magic bytes 尚未写入（要等分钟切换或进程退出时的 `close()` 才写）。此时用 pyarrow 读取该文件会报错：
+
+```
+ArrowInvalid: Parquet magic bytes not found in footer.
+```
+
+已完成的分钟文件（之前 flush 过的）都是完整可读的。
+
+### Python 端判断文件是否完整
+
+Parquet 格式要求文件末尾 4 字节为 `PAR1` magic bytes。检查这 4 字节即可判断文件是否已写完：
+
+```python
+def is_parquet_complete(path):
+    """检查 parquet 文件是否已写完 footer（< 1us）"""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(-4, 2)  # SEEK_END，定位到末尾前 4 字节
+            return f.read(4) == b'PAR1'
+    except (OSError, IOError):
+        return False
+```
+
+### 并发读写安全性
+
+Python 读端和 C++ 写端同时操作同一个文件，在 Linux 上是安全的：
+
+- `FileOutputStream` 每次 `WriteTable()` 调用底层 `write()` 系统调用，数据进入 page cache 后文件大小立即更新，其他进程的 `seek(SEEK_END)` 立即可见
+- 读 4 字节远小于一个 page（4KB），内核保证 page 内的读写一致性，不会读到写了一半的数据
+- 结果只有两种：末尾不是 `PAR1`（还在写），或者是 `PAR1`（footer 已写完）。没有中间态
+
+典型用法：Python 轮询检查新文件，跳过 `is_parquet_complete() == False` 的文件，只读已完成的。
+
 ## 延迟指标
 
-每次分钟切换时打印 flush 延迟：
+每次分钟切换时打印两层延迟和最后一条数据的详情：
 
 ```
-[flush] 0930 latency=12ms tick=92341 order=958123 trade=769045
+[flush] tick 0930 rows=89157 last=300118 nano=09:30:59.999 exch=09:30:51.000 gw=8999ms disk=35ms
 ```
 
-- `latency`：close 3 个文件的总耗时（包含 flush 残余 + 写 footer + fsync）
-- 由于 Row Group 预压缩，大部分数据在分钟内已经写出，flush 时只需处理最后不完整的 batch
-- 典型延迟：< 20ms
+各字段含义：
+
+| 字段 | 含义 |
+|------|------|
+| `rows` | 该分钟写入的总行数 |
+| `last` | 最后一条数据的股票代码 |
+| `nano` | 最后一条数据的 nano_timestamp（HH:MM:SS.mmm） |
+| `exch` | 最后一条数据的 exchange_time（HH:MM:SS.mmm） |
+| `gw` | gateway 延迟 = nano_timestamp - exchange_time |
+| `disk` | 落盘延迟 = parquet close 完成时的墙上时间 - 读到最后一条数据的墙上时间 |
+
+### 两层延迟的含义
+
+**gw（gateway 延迟）**：从交易所产生数据到 gateway 写�� journal 的延迟。包含 Insight SDK 接收 → protobuf 解析 → ConcurrentQueue → writer 线程 → write_frame 的全链路。线上和 replay 模式下都有意义（replay 保留了原始的 nano 和 exchange_time 关系）。
+
+典型观察：
+- 连续竞价时 tick 的 gw ��常 < 100ms（负值正常，说明 nano 在 exch_time 之前）
+- 集合竞价时 order 的 gw 可达数分钟（SH 在 09:25 一次性下发 09:15~09:24 的 order）
+- gw 为负值表示 nano < exch_time：数据在交易所标记时间之前就已到达 gateway
+
+**disk（落盘延迟）**：从 realtime_parquet 读到数据到 parquet 文件 close 完成的延迟。
+
+| 模式 | disk 的含义 |
+|------|------------|
+| 实盘 | journal 写入 → parquet 可读的延迟（因为读到数据 ≈ 数据写入时刻） |
+| replay | realtime_parquet 实际处理延迟（读到数据 → parquet close） |
+
+典型值：< 50ms（Row Group 预压缩的功劳，close 时只需 flush 最后一批 + 写 footer）。
 
 ## 依赖汇总
 
