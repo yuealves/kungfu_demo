@@ -80,10 +80,10 @@ cmake .. && make -j$(nproc)
 ### 3. 运行
 
 ```bash
-# 线上推荐：只处理新数据（跳过 journal 中已有的历史存量）
+# 线上测试时推荐：只处理新数据（跳过 journal 中已有的历史存量）
 ./build/realtime_parquet -o /data/rt_parquet -s now
 
-# 从 journal 开头处理所有数据（本地 replay 测试用）
+# 从 journal 开头处理所有数据（线上部署 & 本地 replay 测试用）
 ./build/realtime_parquet -o /data/rt_parquet
 
 # 指定 journal 目录
@@ -93,10 +93,10 @@ cmake .. && make -j$(nproc)
 参数：
 - `-o output_dir`：输出目录（默认 `./output`）
 - `-d journal_dir`：journal 目录（默认 `/shared/kungfu/journal/user/`）
-- `-s now`：从当前时间开始，跳过 journal 中的历史数据（线上推荐）
+- `-s now`：从当前时间开始，跳过 journal 中的历史数据（线上测试时推荐）
 - `-h`：显示帮助
 
-> **线上部署建议使用 `-s now`**：如果 gateway 已经运行了一段时间（journal 中有大量存量数据），不加 `-s now` 会全速追赶所有历史数据，瞬间占满 CPU 和磁盘 I/O。`-s now` 让 reader 的 `jumpStart` 跳到当前时间，只处理之后的新数据���
+> **线上测试时建议使用 `-s now`**：如果 gateway 已经运行了一段时间（journal 中有大量存量数据），不加 `-s now` 会全速追赶所有历史数据，瞬间占满 CPU 和磁盘 I/O。`-s now` 让 reader 的 `jumpStart` 跳到当前时间，只处理之后的新数据。
 
 ## 配合 replay 脚本测试
 
@@ -143,7 +143,7 @@ print(f'rows: {len(t)}')
 
 ## 打包部署
 
-本项���设计为自包含，可以打包为 tar.gz 直接上传到线上编译。
+本项目设计为自包含，可以打包为 tar.gz 直接上传到线上编译。
 
 ### 打包命令
 
@@ -151,7 +151,7 @@ print(f'rows: {len(t)}')
 # 在 kungfu_demo/ 目录下执行
 # -h 参数解引用符号链接，将实际文件打包进去
 tar -czhf realtime_parquet.tar.gz \
-    -C kungfu_demo \
+    --exclude='realtime_parquet/build' \
     realtime_parquet/
 ```
 
@@ -232,48 +232,47 @@ output_dir/
 - Row Group 大小：50000 行
 - Arrow writer 开启多线程列写入 (`use_threads=true`)
 
-**线程模型**：主循环是单线程（读 journal → 分发 → append → 分钟切换）。唯一的多线程来自 Arrow 内部——`use_threads=true` 让 `WriteTable` 时 Arrow 用全局线程池并行编码/压缩不同列。默认线程池大小 = CPU 核心数（`std::thread::hardware_concurrency()`），仅在写 Row Group 的瞬间（几毫秒）占用，不是持续占用。如果线上担心 CPU 资源，可通过环境变量限制：
+**线程模型**：主循环是单线程（读 journal → 分发 → append → 分钟切换）。唯一的多线程来自 Arrow 内部——`use_threads=true` 让 `WriteTable` 时 Arrow 用全局线程池并行编码/压缩不同列。**默认线程池大小 = 4**（启动时通过 `arrow::SetCpuThreadPoolCapacity` 设置），仅在写 Row Group 的瞬间（几毫秒）占用，不是持续占用。如需调整，可通过环境变量覆盖：
 
 ```bash
-OMP_NUM_THREADS=4 ./realtime_parquet -o /data/rt_parquet -s now
+OMP_NUM_THREADS=2 ./realtime_parquet -o /data/rt_parquet -s now  # 更保守
+OMP_NUM_THREADS=8 ./realtime_parquet -o /data/rt_parquet -s now  # 更激进
 ```
 
 ## 实时读取 Parquet 文件
 
-### 当前正在写入的文件
+### 文件完整性标记
 
-realtime_parquet 进程运行期间，**当前分钟的 parquet 文件尚未完成**——Row Group 数据已写盘，但 footer 和结尾 magic bytes 尚未写入（要等分钟切换或进程退出时的 `close()` 才写）。此时用 pyarrow 读取该文件会报错：
+写入中的文件使用 **dot 前缀**标记未完成状态：
 
 ```
-ArrowInvalid: Parquet magic bytes not found in footer.
+output_dir/20260304/
+  ├── tick_0930.parquet       ← 已完成，可安全读取
+  ├── order_0930.parquet      ← 已完成
+  ├── .tick_0931.parquet      ← 正在写入，不要读取
+  └── .order_0931.parquet     ← 正在写入
 ```
 
-已完成的分钟文件（之前 flush 过的）都是完整可读的。
+写入流程：`open(.tick_0931.parquet)` → 写 Row Group → ... → `close()` 写 footer → `rename(.tick_0931.parquet, tick_0931.parquet)`。
 
-### Python 端判断文件是否完整
+`rename()` 在同一文件系统上是原子操作（inode 指针更新），耗时微秒级，不引入额外延迟。
 
-Parquet 格式要求文件末尾 4 字节为 `PAR1` magic bytes。检查这 4 字节即可判断文件是否已写完：
+### Python 端使用
+
+消费者只需 glob 无 dot 前缀的文件，天然跳过未完成文件：
 
 ```python
-def is_parquet_complete(path):
-    """检查 parquet 文件是否已写完 footer（< 1us）"""
-    try:
-        with open(path, 'rb') as f:
-            f.seek(-4, 2)  # SEEK_END，定位到末尾前 4 字节
-            return f.read(4) == b'PAR1'
-    except (OSError, IOError):
-        return False
+import glob, pyarrow.parquet as pq
+
+# 只匹配已完成的文件（dot 前缀的不会被 glob 匹配）
+for f in sorted(glob.glob('/data/rt_parquet/20260304/tick_*.parquet')):
+    t = pq.read_table(f)
+    ...
 ```
 
-### 并发读写安全性
+### 异常退出
 
-Python 读端和 C++ 写端同时操作同一个文件，在 Linux 上是安全的：
-
-- `FileOutputStream` 每次 `WriteTable()` 调用底层 `write()` 系统调用，数据进入 page cache 后文件大小立即更新，其他进程的 `seek(SEEK_END)` 立即可见
-- 读 4 字节远小于一个 page（4KB），内核保证 page 内的读写一致性，不会读到写了一半的数据
-- 结果只有两种：末尾不是 `PAR1`（还在写），或者是 `PAR1`（footer 已写完）。没有中间态
-
-典型用法：Python 轮询检查新文件，跳过 `is_parquet_complete() == False` 的文件，只读已完成的。
+如果进程被 `kill -9` 强杀，当前分钟的 `.tick_HHMM.parquet` 会残留在磁盘上（无 footer，不完整）。正常 Ctrl+C（SIGINT/SIGTERM）会触发 `close()` + `rename()`，不会残留。
 
 ## 延迟指标
 

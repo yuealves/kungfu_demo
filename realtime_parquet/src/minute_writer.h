@@ -78,6 +78,9 @@ private:
     std::unique_ptr<arrow::Int8Builder>   d_bsFlag_, d_functionCode_, d_orderKind_;
     std::unique_ptr<arrow::FloatBuilder>  d_price_;
 
+    std::string writing_path_;  // 写入时的临时路径（dot 前缀）
+    std::string final_path_;    // close 后 rename 的最终路径
+
     int buffered_rows_ = 0;
     long total_rows_ = 0;
     bool is_open_ = false;

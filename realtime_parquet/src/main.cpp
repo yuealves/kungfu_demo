@@ -14,12 +14,15 @@
 #include "JournalReader.h"
 #include "Timer.h"
 
+#include <arrow/util/thread_pool.h>
+
 #include <iostream>
 #include <iomanip>
 #include <chrono>
 #include <thread>
 #include <csignal>
 #include <atomic>
+#include <cstdlib>
 #include <ctime>
 #include <string>
 #include <sys/stat.h>
@@ -137,6 +140,20 @@ int main(int argc, const char* argv[])
         }
     }
 
+    // 限制 Arrow 全局线程池（默认 4，可通过 OMP_NUM_THREADS 覆盖）
+    {
+        int nthreads = 4;
+        const char* env = std::getenv("OMP_NUM_THREADS");
+        if (env) {
+            int n = std::atoi(env);
+            if (n > 0) nthreads = n;
+        }
+        auto st = arrow::SetCpuThreadPoolCapacity(nthreads);
+        if (!st.ok()) {
+            std::cerr << "[warn] Arrow thread pool: " << st.ToString() << std::endl;
+        }
+    }
+
     // 初始化 JournalReader
     std::string reader_name = "rt_parquet_" + parseNano(getNanoTime(), "%H%M%S");
 
@@ -149,10 +166,11 @@ int main(int argc, const char* argv[])
 
     long start_time = start_from_now ? getNanoTime() : 0;
 
-    std::cout << "[init] reader: " << reader_name << std::endl;
+    std::cout << "[init] reader:  " << reader_name << std::endl;
     std::cout << "[init] journal: " << journal_dir << std::endl;
     std::cout << "[init] output:  " << output_dir << std::endl;
     std::cout << "[init] start:   " << (start_from_now ? "now (skip history)" : "beginning") << std::endl;
+    std::cout << "[init] threads: " << arrow::GetCpuThreadPoolCapacity() << std::endl;
 
     JournalReaderPtr reader = JournalReader::createReaderWithSys(
         dirs, jnames, start_time, reader_name);

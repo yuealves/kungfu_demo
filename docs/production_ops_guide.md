@@ -92,12 +92,12 @@ overlay         1.1T  713G  387G  65%  /
                     ┌────────────┼────────────┐
                     │            │            │
                     ▼            ▼            ▼
-          ┌─────────────┐ ┌──────────┐ ┌──────────────┐
-          │insight_gateway│ │data_fetcher│ │archive_journal│
-          │  行情写入端   │ │ 数据导出   │ │ Parquet 归档  │
-          │  09:10 cron  │ │ 09:20 cron│ │ 16:00 cron   │
-          │  CPU: ~99%   │ │ 3个实例   │ │ 收盘后执行    │
-          └──────────────┘ └──────────┘ └──────────────┘
+          ┌─────────────┐ ┌──────────────┐ ┌──────────────┐
+          │insight_gateway│ │realtime_parquet│ │archive_journal│
+          │  行情写入端   │ │ 实时分钟Parquet│ │ Parquet 归档  │
+          │  09:10 cron  │ │ 09:12 cron   │ │ 16:00 cron   │
+          │  CPU: ~99%   │ │ 单线程主循环  │ │ 收盘后执行    │
+          └──────────────┘ └──────────────┘ └──────────────┘
                     │            │
                     │   写入      │   读取
                     ▼            ▼
@@ -114,9 +114,10 @@ overlay         1.1T  713G  387G  65%  /
 | **supervisord** | 进程管理器，负责拉起和管理 Paged 服务 | 容器启动时自动运行 |
 | **Paged (yjj server)** | KungFu journal 系统核心，管理 mmap 内存映射和页面分配 | supervisord 管理，autostart=true |
 | **insight_gateway** | 连接华泰 Insight 行情服务器，接收 L2 行情写入 journal | cron 09:10 启动 |
-| **data_fetcher** | 从 journal 读取行情数据，按时间间隔导出为 Parquet 文件 | cron 09:20 启动，3 个实例 |
+| **realtime_parquet** | 实时读取 journal，每分钟输出 tick/order/trade Parquet 文件 | cron 09:12 启动，15:51 停止 |
 | **monitor_latency** | 监控行情延迟，输出 CSV 供外网检查 | cron 09:15 启动 |
 | **archive_journal** | 收盘后将当日 journal 归档为 Parquet | cron 16:00 启动 |
+| **data_fetcher** | ~~从 journal 按时间间隔导出 Parquet~~（已停用） | cron 已注释 |
 
 ### 2.3 通信方式
 
@@ -188,6 +189,7 @@ overlay         1.1T  713G  387G  65%  /
 | 路径 | 内容 |
 |------|------|
 | `dump_parquet/` | archive_journal 输出的 Parquet 归档文件（~45GB 累计） |
+| `dump_1m_parquet/` | realtime_parquet 输出的分钟级 Parquet 文件 |
 | `latency_moniter/` | monitor_latency 输出的延迟监控 CSV |
 
 ---
@@ -201,10 +203,12 @@ overlay         1.1T  713G  387G  65%  /
 ```
 分 时  日 月 周  命令
 10 9  * * 1-5  bash /opt/insight_test/start_insight.sh >> /opt/insight_test/insight.log 2>&1
+12 9  * * 1-5  nohup /root/lw_dev/realtime_parquet/build/realtime_parquet -o /data/shenrun/dump_1m_parquet >> /data/shenrun/dump_1m_parquet/realtime_parquet.log 2>&1 &
 15 9  * * 1-5  nohup /root/lw_dev/monitor_latency/build/monitor_latency -o /data/shenrun/latency_moniter >> /data/shenrun/latency_moniter/monitor.log 2>&1 &
-20 9  * * 1-5  bash /opt/insight_test/start_fetcher.sh >> /opt/insight_test/fetcher.log 2>&1
+# 20 9 * * 1-5  bash /opt/insight_test/start_fetcher.sh >> /opt/insight_test/fetcher.log 2>&1   ← data_fetcher 已停用
 22 14 * * 1-5  bash /opt/insight_test/delete_old_data.sh
 50 15 * * 1-5  pkill -f monitor_latency
+51 15 * * 1-5  pkill -f realtime_parquet
 0  16 * * 1-5  cd /root/lw_dev/archive_journal_demo/build && ./archive_journal -i /shared/kungfu/journal/user -o /data/shenrun/dump_parquet -s 256 >> /var/log/archive_journal.log 2>&1
 59 23 * * 1-5  rm -f /shared/kungfu/journal/user/*.journal
 ```
@@ -214,10 +218,10 @@ overlay         1.1T  713G  387G  65%  /
 ```
 09:10  ─── start_insight.sh ─────→ 启动 insight_gateway（先 kill 旧进程）
            │                        连接 Insight 服务器，准备接收行情
+09:12  ─── realtime_parquet ─────→ 启动实时分钟 Parquet 写入
+           │                        读取 journal 全量数据 + 实时跟随
 09:15  ─── monitor_latency ──────→ 启动延迟监控，每秒采样写 CSV
            │
-09:20  ─── start_fetcher.sh ─────→ 启动 3 个 data_fetcher 实例
-           │                        --tick-only / --order-only / --trade-only
 09:25  ─── 集合竞价开始 ─────────→ insight_gateway 开始接收并写入 journal
 09:30  ─── 连续竞价开始 ─────────→ 全速运行
   :
@@ -226,7 +230,9 @@ overlay         1.1T  713G  387G  65%  /
   :
 14:22  ─── delete_old_data.sh ───→ 清理 /data/dump 下 >7天 的旧文件
 15:00  ─── 收盘 ─────────────────→ 行情结束
+15:30  ─── 行情停止 ─────────────→ gateway 停止接收数据
 15:50  ─── pkill monitor_latency → 停止延迟监控
+15:51  ─── pkill realtime_parquet→ 停止实时 Parquet（SIGTERM → flush + rename）
 16:00  ─── archive_journal ──────→ 当日 journal 转 Parquet 归档
            │                        输出到 /data/shenrun/dump_parquet/
 23:59  ─── rm *.journal ─────────→ 清理当日所有 journal 文件
@@ -238,18 +244,19 @@ overlay         1.1T  713G  387G  65%  /
 
 `start_insight.sh` 会先 `kill -9` 所有已有的 `insight_gateway` 进程，然后在 `/opt/insight_test/market_gateway/build/src/brokers/insight_tcp/` 目录下启动新实例。提前于 09:25 集合竞价 15 分钟启动，留出连接 Insight 服务器和登录的时间。
 
+**09:12 — realtime_parquet 启动**
+
+从 journal 开头读取全量数据（09:10 gateway 启动后写入的 2 分钟数据），追赶完成后进入实时跟随模式。每分钟输出 tick/order/trade 各一个 Parquet 文件到 `/data/shenrun/dump_1m_parquet/YYYYMMDD/`。写入中的文件使用 dot 前缀（如 `.tick_0930.parquet`），close 后 rename 为正常文件名（`tick_0930.parquet`）。
+
+假期（无数据）时空转等待，15:51 被 pkill 正常退出，不创建任何文件。
+
 **09:15 — 延迟监控启动**
 
 `monitor_latency` 持续读取 tick/order/trade 三个频道的最新 journal 时间戳和交易所时间戳，每秒追加写入 `/data/shenrun/latency_moniter/latency_YYYYMMDD.csv`，供公司 IT 从外网检查行情延迟。
 
-**09:20 — data_fetcher 启动**
+**~~09:20 — data_fetcher 启动~~（已停用）**
 
-`start_fetcher.sh` 先 kill 旧进程，然后启动 3 个实例：
-- `./data_fetcher --tick-only --interval 1 &`（CPU ~21%）
-- `./data_fetcher --order-only --interval 1 &`（CPU ~10%）
-- `./data_fetcher --trade-only --interval 1 &`（CPU ~0%）
-
-按 config.json 配置的时间间隔（默认 5 分钟），读取 journal 数据导出为 Parquet 文件到 `/data/dump_5m/`。
+crontab 中已注释。原功能由 realtime_parquet 替代。
 
 **14:22 — 旧数据清理**
 
@@ -368,7 +375,28 @@ ps -ef | grep data_fetcher | grep -v grep
 tail -f /opt/insight_test/fetcher.log
 ```
 
-### 5.5 monitor_latency 管理
+### 5.5 realtime_parquet 管理
+
+```bash
+# 启动
+nohup /root/lw_dev/realtime_parquet/build/realtime_parquet \
+    -o /data/shenrun/dump_1m_parquet \
+    >> /data/shenrun/dump_1m_parquet/realtime_parquet.log 2>&1 &
+
+# 停止（SIGTERM 触发 flush + rename，最后一个文件正常完成）
+pkill -f realtime_parquet
+
+# 查看状态
+ps -ef | grep realtime_parquet | grep -v grep
+
+# 查看日志
+tail -f /data/shenrun/dump_1m_parquet/realtime_parquet.log
+
+# 查看输出文件（注意 dot 前缀的文件是正在写入的）
+ls /data/shenrun/dump_1m_parquet/$(date +%Y%m%d)/
+```
+
+### 5.6 monitor_latency 管理
 
 ```bash
 # 启动
@@ -383,7 +411,7 @@ pkill -f monitor_latency
 tail -f /data/shenrun/latency_moniter/latency_$(date +%Y%m%d).csv
 ```
 
-### 5.6 archive_journal 手动执行
+### 5.7 archive_journal 手动执行
 
 ```bash
 cd /root/lw_dev/archive_journal_demo/build
@@ -402,16 +430,14 @@ tail -f /var/log/archive_journal.log
 ls -la /data/shenrun/dump_parquet/
 ```
 
-### 5.7 完整重启流程（按顺序）
+### 5.8 完整重启流程（按顺序）
 
 当需要完全重启所有服务时，按以下顺序执行：
 
 ```bash
 # ===== 1. 停止所有行情相关进程 =====
-# 停止 data_fetcher
-for pid in $(ps -ef | grep data_fetcher | grep -v grep | awk '{print $2}'); do
-    kill -9 $pid
-done
+# 停止 realtime_parquet（SIGTERM 触发 flush + rename）
+pkill -f realtime_parquet
 
 # 停止 insight_gateway
 for pid in $(ps -ef | grep insight_gateway | grep -v grep | awk '{print $2}'); do
@@ -440,9 +466,11 @@ file /shared/kungfu/socket/paged.sock
 # ===== 5. 启动 insight_gateway =====
 bash /opt/insight_test/start_insight.sh >> /opt/insight_test/insight.log 2>&1
 
-# ===== 6. 等待 10 秒后启动 data_fetcher =====
-sleep 10
-bash /opt/insight_test/start_fetcher.sh >> /opt/insight_test/fetcher.log 2>&1
+# ===== 6. 启动 realtime_parquet =====
+sleep 3
+nohup /root/lw_dev/realtime_parquet/build/realtime_parquet \
+    -o /data/shenrun/dump_1m_parquet \
+    >> /data/shenrun/dump_1m_parquet/realtime_parquet.log 2>&1 &
 
 # ===== 7. 启动 monitor_latency =====
 nohup /root/lw_dev/monitor_latency/build/monitor_latency \
@@ -450,7 +478,7 @@ nohup /root/lw_dev/monitor_latency/build/monitor_latency \
     >> /data/shenrun/latency_moniter/monitor.log 2>&1 &
 
 # ===== 8. 验证所有进程 =====
-ps -ef | grep -E "yjj server|insight_gateway|data_fetcher|monitor_latency" | grep -v grep
+ps -ef | grep -E "yjj server|insight_gateway|realtime_parquet|monitor_latency" | grep -v grep
 ```
 
 ---
@@ -461,7 +489,7 @@ ps -ef | grep -E "yjj server|insight_gateway|data_fetcher|monitor_latency" | gre
 
 ```bash
 # 一键检查所有关键进程
-ps -ef | grep -E "supervisord|yjj server|insight_gateway|data_fetcher|monitor_latency" | grep -v grep
+ps -ef | grep -E "supervisord|yjj server|insight_gateway|realtime_parquet|monitor_latency" | grep -v grep
 ```
 
 预期输出（开盘时段）：
@@ -471,9 +499,7 @@ bruce   3229     0  supervisord -c /opt/kungfu/master/etc/supervisor/supervisord
 bruce   3230  3229  python -u /opt/kungfu/master/bin/yjj server
 bruce   3231  3230  python -u /opt/kungfu/master/bin/yjj server    ← Paged 实际进程
 root   24430 24420  ./insight_gateway                               ← 行情写入
-root   24463     1  ./data_fetcher --tick-only --interval 1
-root   24464     1  ./data_fetcher --order-only --interval 1
-root   24465     1  ./data_fetcher --trade-only --interval 1
+root   24500     1  ./realtime_parquet -o /data/shenrun/dump_1m_parquet  ← 实时分钟 Parquet
 ```
 
 **检查 Paged socket 是否正常：**
@@ -516,7 +542,7 @@ python2 -u /opt/kungfu/master/bin/yjj status
 | Supervisor/yjj 日志 | `/shared/kungfu/log/supervisor/yjj.log` | `tail -f /shared/kungfu/log/supervisor/yjj.log` |
 | Supervisord 日志 | `/shared/kungfu/log/supervisor/supervisord.log` | `tail -100 /shared/kungfu/log/supervisor/supervisord.log` |
 | insight_gateway 日志 | `/opt/insight_test/insight.log` | `tail -f /opt/insight_test/insight.log` |
-| data_fetcher 日志 | `/opt/insight_test/fetcher.log` | `tail -f /opt/insight_test/fetcher.log` |
+| realtime_parquet 日志 | `/data/shenrun/dump_1m_parquet/realtime_parquet.log` | `tail -f /data/shenrun/dump_1m_parquet/realtime_parquet.log` |
 | monitor_latency 日志 | `/data/shenrun/latency_moniter/monitor.log` | `tail -f /data/shenrun/latency_moniter/monitor.log` |
 | archive_journal 日志 | `/var/log/archive_journal.log` | `tail -f /var/log/archive_journal.log` |
 
@@ -757,7 +783,7 @@ df -h /
 
 # ===== Step 2: 清理所有残留 =====
 # 停止所有行情进程
-for proc in insight_gateway data_fetcher monitor_latency; do
+for proc in insight_gateway realtime_parquet monitor_latency; do
     for pid in $(ps -ef | grep "$proc" | grep -v grep | awk '{print $2}'); do
         kill -9 $pid 2>/dev/null
     done
@@ -787,14 +813,16 @@ python2 -u /opt/kungfu/master/bin/yjj status
 
 # ===== Step 5: 如果在交易时段，启动行情服务 =====
 bash /opt/insight_test/start_insight.sh >> /opt/insight_test/insight.log 2>&1
-sleep 10
-bash /opt/insight_test/start_fetcher.sh >> /opt/insight_test/fetcher.log 2>&1
+sleep 3
+nohup /root/lw_dev/realtime_parquet/build/realtime_parquet \
+    -o /data/shenrun/dump_1m_parquet \
+    >> /data/shenrun/dump_1m_parquet/realtime_parquet.log 2>&1 &
 nohup /root/lw_dev/monitor_latency/build/monitor_latency \
     -o /data/shenrun/latency_moniter \
     >> /data/shenrun/latency_moniter/monitor.log 2>&1 &
 
 # ===== Step 6: 最终验证 =====
-ps -ef | grep -E "supervisord|yjj server|insight_gateway|data_fetcher|monitor_latency" | grep -v grep
+ps -ef | grep -E "supervisord|yjj server|insight_gateway|realtime_parquet|monitor_latency" | grep -v grep
 echo "--- Journal 文件检查 ---"
 ls -lt /shared/kungfu/journal/user/ | head -5
 ```

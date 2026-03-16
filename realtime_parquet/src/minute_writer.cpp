@@ -1,6 +1,7 @@
 #include "minute_writer.h"
 
 #include <iostream>
+#include <cstdio>
 #include <stdexcept>
 
 #define ARROW_OK_OR_THROW(expr)                                  \
@@ -219,7 +220,16 @@ void MinuteWriter::init_builders() {
 // ---------------------------------------------------------------------------
 
 void MinuteWriter::open(const std::string& filepath) {
-    ARROW_ASSIGN_OR_THROW(outfile_, arrow::io::FileOutputStream::Open(filepath));
+    final_path_ = filepath;
+    // 写入时使用 dot 前缀，close 后 rename 为最终路径
+    auto slash = filepath.rfind('/');
+    if (slash != std::string::npos) {
+        writing_path_ = filepath.substr(0, slash + 1) + "." + filepath.substr(slash + 1);
+    } else {
+        writing_path_ = "." + filepath;
+    }
+
+    ARROW_ASSIGN_OR_THROW(outfile_, arrow::io::FileOutputStream::Open(writing_path_));
 
     auto props = parquet::WriterProperties::Builder()
         .compression(arrow::Compression::SNAPPY)
@@ -244,6 +254,12 @@ void MinuteWriter::close() {
     writer_.reset();
     outfile_.reset();
     is_open_ = false;
+
+    // rename: .tick_0930.parquet → tick_0930.parquet（同 fs 原子操作，~微秒）
+    if (std::rename(writing_path_.c_str(), final_path_.c_str()) != 0) {
+        std::cerr << "[warn] rename failed: " << writing_path_
+                  << " -> " << final_path_ << std::endl;
+    }
 }
 
 // ---------------------------------------------------------------------------
