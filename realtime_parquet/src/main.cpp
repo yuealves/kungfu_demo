@@ -9,6 +9,7 @@
  */
 
 #include "minute_writer.h"
+#include "kbar_builder.h"
 #include "data_types.h"
 
 #include "JournalReader.h"
@@ -195,6 +196,8 @@ int main(int argc, const char* argv[])
         {"trade", MinuteWriter::TRADE},
     };
 
+    KBarBuilder kbar_builder(output_dir);
+
     std::string current_date;
     std::string current_dir;
 
@@ -205,6 +208,7 @@ int main(int argc, const char* argv[])
             current_dir = output_dir + "/" + current_date;
             mkdir_p(current_dir);
             std::cout << "[dir] " << current_dir << std::endl;
+            kbar_builder.set_date(current_date);
         }
     };
 
@@ -315,6 +319,7 @@ int main(int argc, const char* argv[])
             ch.last_exch_time = md->Time;
             ch.last_symbol = md->Symbol;
             ch.writer.append_trade(md, nano);
+            kbar_builder.push_trade(md, nano);
         }
     }
 
@@ -325,6 +330,8 @@ int main(int argc, const char* argv[])
             ch.total_rows += ch.writer.row_count();
         }
     }
+
+    kbar_builder.stop();
 
     std::cout << "\n[done] total tick=" << channels[0].total_rows
               << " order=" << channels[1].total_rows
