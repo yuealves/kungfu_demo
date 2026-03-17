@@ -49,6 +49,14 @@ static int nano_to_hhmm(int64_t nano) {
     return g_cached_hhmm;
 }
 
+// HHMM 加一分钟（处理跨小时进位：1059 → 1100）
+static int next_minute(int hhmm) {
+    int h = hhmm / 100;
+    int m = hhmm % 100 + 1;
+    if (m >= 60) { m = 0; h++; }
+    return h * 100 + m;
+}
+
 // 从纳秒时间戳提取 YYYYMMDD 日期字符串
 static std::string nano_to_date(int64_t nano) {
     time_t sec = nano / 1000000000LL;
@@ -228,7 +236,7 @@ int main(int argc, const char* argv[])
             int et_s = (et / 1000) % 100, et_ms = et % 1000;
 
             char ms[8];
-            snprintf(ms, sizeof(ms), "%04d", ch.current_minute);
+            snprintf(ms, sizeof(ms), "%04d", next_minute(ch.current_minute));
             char nano_str[16], exch_str[16];
             snprintf(nano_str, sizeof(nano_str), "%02d:%02d:%02d.%03d",
                      last_tm.tm_hour, last_tm.tm_min, last_tm.tm_sec, last_ms);
@@ -247,10 +255,10 @@ int main(int argc, const char* argv[])
             ch.total_rows += ch.writer.row_count();
         }
 
-        // 打开新文件
+        // 打开新文件（以结束分钟命名：[09:30,09:31) 的数据 → tick_0931.parquet）
         ensure_dir(nano);
         char minute_str[8];
-        snprintf(minute_str, sizeof(minute_str), "%04d", minute);
+        snprintf(minute_str, sizeof(minute_str), "%04d", next_minute(minute));
         ch.writer.open(current_dir + "/" + ch.name + "_" + minute_str + ".parquet");
         ch.current_minute = minute;
     };
