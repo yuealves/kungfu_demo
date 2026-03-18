@@ -68,17 +68,17 @@ static std::vector<RecordT> read_journal_parallel(
 
     auto worker = [&](int tid) {
         auto& local = thread_results[tid];
-        while (true) {
-            size_t fi = next_file.fetch_add(1);
-            if (fi >= files.size()) break;
-
+        // 每个线程顺序读取一段连续的文件，避免 fetch_add 导致的乱序
+        size_t num_files = files.size();
+        size_t files_per_thread = (num_files + actual_threads - 1) / actual_threads;
+        size_t start = tid * files_per_thread;
+        size_t end = std::min(start + files_per_thread, num_files);
+        for (size_t fi = start; fi < end; ++fi) {
             const auto& filepath = files[fi];
             LocalJournalPage page;
             if (!page.load(filepath)) {
                 std::lock_guard<std::mutex> lk(cout_mtx);
-                std::cout << "[" << label << "] (" << (done_count + 1) << "/" << files.size()
-                          << ") " << filepath << " -- SKIP (load failed)" << std::endl;
-                done_count.fetch_add(1);
+                std::cout << "[" << label << "] (" << (fi + 1) << "/" << files.size() << ") " << filepath << " -- SKIP (load failed)" << std::endl;
                 continue;
             }
 
@@ -92,10 +92,9 @@ static std::vector<RecordT> read_journal_parallel(
             }
 
             size_t added = local.size() - count_before;
-            size_t done = done_count.fetch_add(1) + 1;
             {
                 std::lock_guard<std::mutex> lk(cout_mtx);
-                std::cout << "[" << label << "] (" << done << "/" << files.size()
+                std::cout << "[" << label << "] (" << (fi + 1) << "/" << files.size()
                           << ") " << filepath << " -> +" << added << std::endl;
             }
         }
