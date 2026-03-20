@@ -1,0 +1,1 @@
+../archive_journal_demo/setup_parquet.sh
