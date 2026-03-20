@@ -1,36 +1,21 @@
 #!/usr/bin/env python3
 """
-根据聚宽 tick_l1 快照生成聚宽口径的 1 分钟 K 线。
+根据华泰 Insight L2 tick 快照生成聚宽口径的 1 分钟 K 线。
 
-这个脚本是“纯生成版”脚本，只做一件事:
-- 读取 tick parquet
-- 按当前已验证通过的聚宽规则生成 1m bar
-- 输出 parquet
+华泰 tick 数据格式与聚宽 tick_l1 本质相同（来自同一交易所数据源），
+只是列名、单位和文件组织方式不同：
 
-适用场景:
-- 你已经有某交易日的聚宽 tick_l1 数据
-- 你希望直接产出与聚宽 price_1m 一致的分钟线
-- 你不需要 compare_jq_1m.py 里的 diff / report / 实验逻辑
+    华泰                        聚宽 tick_l1
+    ─────────────────────────  ─────────────────
+    Price (float32, ×10000)    current (float64, 元)
+    High  (float32, ×10000)    high (float64, 元)
+    Low   (float32, ×10000)    low (float64, 元)
+    AccVolume (int64, 股)      volume (float64, 股)
+    AccTurnover (int64, 元)    money (float64, 元)
+    Symbol (int32) + exchange  code (str, e.g. '000001.XSHE')
+    Time (int32, HHMMSSmmm)    datetime (timestamp)
 
-脚本依赖的额外信息:
-1. 前一交易日最后一根 1m close
-   用于处理:
-   - 开盘初段 tick 全 0 的股票
-   - 当天完全没有任何 tick，但聚宽仍给出整天静态分钟线的股票
-2. 当天股票池
-   如果你想完整复现“当天全市场”的聚宽 1m，必须知道当天应该输出哪些股票。
-   默认脚本会优先使用当天 price_1m 文件中的 code 作为股票池；
-   如果没有当天 price_1m，就需要你通过 --universe-path 提供一个至少包含 code 列的文件。
-
-当前脚本实现的关键规则:
-- 集合竞价 09:25-09:29:59 并入 09:31
-- 普通 HH:MM:00 tick 归到下一根 bar，11:30:00 / 15:00:00 保留在本分钟
-- open/close 只使用“有成交变化”的有效 tick.current
-- high/low 以 tick.current 为主，同时吸收分钟内 tick.high/tick.low 的更新值
-- 11:30 和 15:00 边界会回补 session 结束后的第一条 tick
-- 15:00 单独按“收盘撮合 bar”处理
-- 对早盘全 0 或全天无 tick 的股票，用前一交易日最后一根 1m close 静态回填
-- 输出时把 OHLC / money / volume 规范到与聚宽 parquet 一致的数值表现
+合成规则与 generate_1m_kbar.py 完全一致（聚宽口径）。
 """
 
 from __future__ import annotations
@@ -50,33 +35,36 @@ CALL_AUCTION_START = "09:25:00"
 CLOSE_CARRY_END = "15:05:00"
 
 
+# ─────────────────── 华泰数据加载与转换 ───────────────────
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="读取聚宽 tick_l1，按聚宽口径生成 1 分钟 K 线。"
+        description="读取华泰 Insight L2 tick 数据，按聚宽口径生成 1 分钟 K 线。"
     )
     parser.add_argument("--date", default="2026-03-17", help="交易日，格式 YYYY-MM-DD。")
     parser.add_argument(
-        "--tick-path",
-        default=None,
-        help="tick parquet 路径，默认使用 ./jq_data/tick_l1/{date}.parquet",
+        "--tick-dir",
+        default="/data/tickl2_data_ht2_raw",
+        help="华泰 tick 数据根目录，默认 /data/tickl2_data_ht2_raw",
     )
     parser.add_argument(
         "--prev-1m-dir",
-        default=None,
-        help="用于读取前一交易日 1m 数据目录，默认使用 ./jq_data/price_1m",
+        default="/nkd_shared/assets/stock/price/price_1m",
+        help="聚宽 price_1m 目录，用于读取前一交易日 close。",
     )
     parser.add_argument(
         "--universe-path",
         default=None,
         help=(
             "可选的股票全集 parquet。若提供，会用其中的 code 作为输出股票池。"
-            "默认优先使用 ./jq_data/price_1m/{date}.parquet；若不存在，则退化为 tick 中出现过的股票。"
+            "默认优先使用 price_1m/{date}.parquet；若不存在，则退化为 tick 中出现过的股票。"
         ),
     )
     parser.add_argument(
         "--output-path",
         default=None,
-        help="输出 parquet 路径，默认使用 ./generated_1m_{date}.parquet",
+        help="输出 parquet 路径，默认使用 ./generated_1m_ht_{date}.parquet",
     )
     parser.add_argument(
         "--code",
@@ -87,40 +75,76 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def trading_minutes(date_str: str) -> pd.DatetimeIndex:
-    morning = pd.date_range(f"{date_str} 09:31:00", f"{date_str} 11:30:00", freq="1min")
-    afternoon = pd.date_range(f"{date_str} 13:01:00", f"{date_str} 15:00:00", freq="1min")
-    return morning.append(afternoon)
+def _ht_time_to_datetime(time_col: pd.Series, date_str: str) -> pd.Series:
+    """
+    将华泰 Time (int32, HHMMSSmmm) 转为 pandas Timestamp。
+
+    格式：HH * 10_000_000 + MM * 100_000 + SS * 1_000 + ms
+    例如：93015000 → 09:30:15.000
+    """
+    t = time_col.astype(np.int64)
+    hh = t // 10_000_000
+    mm = (t % 10_000_000) // 100_000
+    ss = (t % 100_000) // 1_000
+    ms = t % 1_000
+    base = pd.Timestamp(date_str)
+    delta = pd.to_timedelta(hh * 3600 + mm * 60 + ss, unit="s") + pd.to_timedelta(ms, unit="ms")
+    return base + delta
 
 
-def load_tick(tick_path: Path, codes: list[str] | None) -> pd.DataFrame:
-    tick = pd.read_parquet(
-        tick_path,
-        columns=["datetime", "code", "current", "high", "low", "volume", "money"],
-    )
-    tick["datetime"] = pd.to_datetime(tick["datetime"])
+def _ht_symbol_to_code(symbol: pd.Series, exchange: pd.Series) -> pd.Series:
+    """
+    将华泰 Symbol (int) + exchange ('SZ'/'SH') 转为聚宽风格代码。
+
+    例如：Symbol=1, exchange='SZ' → '000001.XSHE'
+          Symbol=600000, exchange='SH' → '600000.XSHG'
+    """
+    sym_str = symbol.astype(str).str.zfill(6)
+    suffix = exchange.map({"SZ": ".XSHE", "SH": ".XSHG"})
+    return sym_str + suffix
+
+
+def load_ht_tick(tick_dir: Path, date_str: str, codes: list[str] | None) -> pd.DataFrame:
+    """
+    读取华泰某日全部 tick parquet 文件，转换为聚宽 tick_l1 等价格式。
+
+    输出列：datetime, code, current, high, low, volume, money
+    """
+    date_dir = tick_dir / date_str
+    date_nodash = date_str.replace("-", "")
+    files = sorted(date_dir.glob(f"{date_nodash}_tick_data_*.parquet"))
+    if not files:
+        raise FileNotFoundError(f"找不到华泰 tick 文件: {date_dir}/{date_nodash}_tick_data_*.parquet")
+
+    cols = ["Symbol", "exchange", "Time", "Price", "High", "Low", "AccVolume", "AccTurnover"]
+    frames = []
+    for f in files:
+        df = pd.read_parquet(f, columns=cols)
+        frames.append(df)
+    raw = pd.concat(frames, ignore_index=True)
+
+    tick = pd.DataFrame()
+    tick["datetime"] = _ht_time_to_datetime(raw["Time"], date_str)
+    tick["code"] = _ht_symbol_to_code(raw["Symbol"], raw["exchange"])
+    tick["current"] = raw["Price"].astype(np.float64) / 10000.0
+    tick["high"] = raw["High"].astype(np.float64) / 10000.0
+    tick["low"] = raw["Low"].astype(np.float64) / 10000.0
+    tick["volume"] = raw["AccVolume"].astype(np.float64)
+    tick["money"] = raw["AccTurnover"].astype(np.float64)
+
     if codes:
         tick = tick[tick["code"].isin(codes)].copy()
     tick = tick.sort_values(["code", "datetime"], kind="stable").reset_index(drop=True)
     return tick
 
 
-def resolve_paths(base_dir: Path, args: argparse.Namespace) -> tuple[Path, Path | None, Path]:
-    tick_path = Path(args.tick_path) if args.tick_path else base_dir / "jq_data" / "tick_l1" / f"{args.date}.parquet"
-    prev_1m_dir = Path(args.prev_1m_dir) if args.prev_1m_dir else base_dir / "jq_data" / "price_1m"
+# ─────────────────── 以下为合成逻辑（与 generate_1m_kbar.py 完全一致） ───────────────────
 
-    if args.output_path:
-        output_path = Path(args.output_path)
-    else:
-        output_path = base_dir / f"generated_1m_{args.date}.parquet"
 
-    if args.universe_path:
-        universe_path = Path(args.universe_path)
-    else:
-        default_universe = prev_1m_dir / f"{args.date}.parquet"
-        universe_path = default_universe if default_universe.exists() else None
-
-    return tick_path, universe_path, output_path
+def trading_minutes(date_str: str) -> pd.DatetimeIndex:
+    morning = pd.date_range(f"{date_str} 09:31:00", f"{date_str} 11:30:00", freq="1min")
+    afternoon = pd.date_range(f"{date_str} 13:01:00", f"{date_str} 15:00:00", freq="1min")
+    return morning.append(afternoon)
 
 
 def load_prev_day_close(prev_1m_dir: Path, date_str: str, codes: list[str] | None) -> pd.DataFrame:
@@ -147,14 +171,6 @@ def load_universe_codes(
     prev_day_close: pd.DataFrame,
     codes: list[str] | None,
 ) -> list[str]:
-    """
-    生成输出股票池。
-
-    说明:
-    1. 如果用户给了 universe_path，就优先使用它的 code 集合作为输出股票池。
-    2. 如果没给 universe_path，就只能退化为 tick 中出现过的股票。
-    3. 为了兼容“全天没有任何 tick，但聚宽仍输出静态 bar”的情况，会把 prev_day_close 中的股票并进来。
-    """
     code_set = set(tick["code"])
     if universe_path is not None and universe_path.exists():
         universe = pd.read_parquet(universe_path, columns=["code"])
@@ -174,12 +190,6 @@ def is_exact_minute(ts: pd.Series) -> pd.Series:
 
 
 def assign_bar_end(tick: pd.DataFrame) -> pd.Series:
-    """
-    聚宽风格分钟切片:
-
-    - 普通的 HH:MM:00 归到下一根分钟线
-    - 但 11:30:00 和 15:00:00 保留在本分钟
-    """
     ts = tick["datetime"]
     exact_minute = is_exact_minute(ts)
     session_end = ts.dt.strftime("%H:%M:%S").isin([MORNING_END, AFTERNOON_END]) & exact_minute
@@ -189,12 +199,6 @@ def assign_bar_end(tick: pd.DataFrame) -> pd.Series:
 
 
 def build_baseline(tick: pd.DataFrame, date_str: str) -> pd.DataFrame:
-    """
-    baseline 用于处理开盘前累计量额，以及开盘前最后一个参考价。
-
-    这里把 09:25 之前最后一条快照作为 baseline。
-    因为 09:25-09:29 的集合竞价会并入 09:31，所以 baseline 要停在 09:25 之前。
-    """
     cutoff = pd.Timestamp(f"{date_str} {CALL_AUCTION_START}")
     pre_open = tick[tick["datetime"] < cutoff]
     baseline = (
@@ -212,13 +216,6 @@ def build_baseline(tick: pd.DataFrame, date_str: str) -> pd.DataFrame:
 
 
 def filter_trading_ticks(tick: pd.DataFrame, date_str: str) -> pd.DataFrame:
-    """
-    只保留聚宽 1m 需要参与合成的时段:
-
-    - 集合竞价 09:25-09:29:59.xxx
-    - 上午连续竞价 09:30-11:30
-    - 下午连续竞价 13:00-15:00
-    """
     call_auction = tick["datetime"].between(
         pd.Timestamp(f"{date_str} {CALL_AUCTION_START}"),
         pd.Timestamp(f"{date_str} {MORNING_START}") - pd.Timedelta(microseconds=1),
@@ -249,8 +246,6 @@ def add_changed_flags(tick: pd.DataFrame) -> pd.DataFrame:
 def add_bar_end_and_auction_bucket(tick: pd.DataFrame, date_str: str) -> pd.DataFrame:
     tick = tick.copy()
     tick["bar_end"] = assign_bar_end(tick)
-
-    # 集合竞价统一并入 09:31 这根 bar。
     call_auction_mask = tick["datetime"].between(
         pd.Timestamp(f"{date_str} {CALL_AUCTION_START}"),
         pd.Timestamp(f"{date_str} {MORNING_START}") - pd.Timedelta(microseconds=1),
@@ -261,15 +256,6 @@ def add_bar_end_and_auction_bucket(tick: pd.DataFrame, date_str: str) -> pd.Data
 
 
 def carry_session_end_ticks(raw_tick: pd.DataFrame, date_str: str) -> pd.DataFrame:
-    """
-    聚宽在 11:30 和 15:00 边界附近不是简单截断。
-
-    这里把:
-    - 午盘结束后第一条 tick 回补到 11:30
-    - 收盘后第一条 tick 回补到 15:00
-
-    这一步主要用于对齐午盘边界和收盘撮合边界。
-    """
     morning_end = pd.Timestamp(f"{date_str} {MORNING_END}")
     afternoon_start = pd.Timestamp(f"{date_str} {AFTERNOON_START}")
     afternoon_end = pd.Timestamp(f"{date_str} {AFTERNOON_END}")
@@ -298,13 +284,6 @@ def carry_session_end_ticks(raw_tick: pd.DataFrame, date_str: str) -> pd.DataFra
 
 
 def select_price_ticks(tick: pd.DataFrame) -> pd.DataFrame:
-    """
-    聚宽分钟价格更像是只使用“有成交变化”的有效 tick。
-
-    这里的过滤规则是:
-    - 相对上一条 tick，volume 或 money 发生变化
-    - current > 0
-    """
     price_ticks = tick.copy()
     prev_volume = price_ticks.groupby("code", sort=False)["volume"].shift()
     prev_money = price_ticks.groupby("code", sort=False)["money"].shift()
@@ -312,8 +291,6 @@ def select_price_ticks(tick: pd.DataFrame) -> pd.DataFrame:
     price_ticks = price_ticks[changed.fillna(True)].copy()
     price_ticks = price_ticks[price_ticks["current"] > 0].copy()
 
-    # 如果某根 bar 只有回补的收盘后 tick，没有 bar 内有效价格 tick，
-    # 则把 bar_end 之前最后一个有效价也并进来，保证 open/high 能挂住收盘前价格。
     if "is_carry_tick" in tick.columns:
         base_valid = tick[tick["current"] > 0].copy()
         price_ticks["is_pre_end_tick"] = price_ticks["datetime"] <= price_ticks["bar_end"]
@@ -350,15 +327,6 @@ def aggregate_intraday_bars(
     codes: list[str],
     minutes: pd.DatetimeIndex,
 ) -> pd.DataFrame:
-    """
-    这是日内普通分钟 bar 的主合成流程。
-
-    核心思路:
-    - volume/money 取每分钟最后一条快照的累计值，再做差分
-    - open/close/high/low 只用“有成交变化”的 tick.current 合成
-    - high/low 额外吸收分钟内 tick.high/tick.low 的更新值
-    - 空分钟沿用上一有效价格，量额为 0
-    """
     agg_vm = (
         tick.groupby(["code", "bar_end"], sort=False)
         .agg(
@@ -446,10 +414,11 @@ def apply_morning_end_rule(result: pd.DataFrame, raw_tick: pd.DataFrame, date_st
     类似 15:00 的收盘撮合 bar 逻辑。
     """
     morning_end_dt = pd.Timestamp(f"{date_str} {MORNING_END}")
-    bar_start = morning_end_dt - pd.Timedelta(minutes=1)
+    bar_start = morning_end_dt - pd.Timedelta(minutes=1)  # 11:29:00
 
     raw = raw_tick.sort_values(["code", "datetime"], kind="stable").copy()
 
+    # 11:30 bar 内、11:30:00 之前的有效快照
     pre_end = raw[
         (raw["datetime"] >= bar_start)
         & (raw["datetime"] < morning_end_dt)
@@ -458,6 +427,7 @@ def apply_morning_end_rule(result: pd.DataFrame, raw_tick: pd.DataFrame, date_st
     if pre_end.empty:
         return result
 
+    # 只处理窗口内 volume 不变的股票（= 没有 intra-minute trade）
     vol_agg = pre_end.groupby("code", sort=False)["volume"].agg(["first", "last"])
     no_trade_codes = set(vol_agg[vol_agg["first"] == vol_agg["last"]].index)
     if not no_trade_codes:
@@ -498,15 +468,6 @@ def apply_morning_end_rule(result: pd.DataFrame, raw_tick: pd.DataFrame, date_st
 
 
 def apply_close_auction_rule(result: pd.DataFrame, raw_tick: pd.DataFrame, date_str: str) -> pd.DataFrame:
-    """
-    对 15:00 单独套收盘撮合规则。
-
-    这一步不能沿用普通分钟逻辑，因为聚宽的 15:00 更像:
-    - open = 收盘撮合前最后有效价
-    - close = 收盘撮合后第一条有效价
-    - high/low = open 和 close 的极值
-    - volume/money = 收盘撮合后的累计值减去撮合前累计值
-    """
     close_bar_dt = pd.Timestamp(f"{date_str} {AFTERNOON_END}")
     raw = raw_tick.sort_values(["code", "datetime"], kind="stable").copy()
 
@@ -590,14 +551,6 @@ def apply_close_auction_rule(result: pd.DataFrame, raw_tick: pd.DataFrame, date_
 
 
 def apply_prev_close_fill(result: pd.DataFrame, raw_tick: pd.DataFrame, prev_day_close: pd.DataFrame) -> pd.DataFrame:
-    """
-    处理两类异常:
-
-    1. 开盘初段 tick 全 0，直到后面才出现第一条有效 tick
-       这时前面的 0 成交 bar 用前一交易日最后 1m close 填价。
-    2. 当天完全没有任何 tick 的股票
-       这时整天 240 根 bar 都用前一交易日最后 1m close 静态填充。
-    """
     if prev_day_close.empty:
         return result
 
@@ -611,7 +564,10 @@ def apply_prev_close_fill(result: pd.DataFrame, raw_tick: pd.DataFrame, prev_day
     if not first_valid.empty:
         first_valid["first_valid_bar_end"] = first_valid["first_valid_dt"].dt.floor("min") + pd.Timedelta(minutes=1)
 
-    merged = result.merge(first_valid[["code", "first_valid_bar_end"]] if not first_valid.empty else pd.DataFrame(columns=["code", "first_valid_bar_end"]), on="code", how="left")
+    merged = result.merge(
+        first_valid[["code", "first_valid_bar_end"]] if not first_valid.empty else pd.DataFrame(columns=["code", "first_valid_bar_end"]),
+        on="code", how="left",
+    )
     merged = merged.merge(prev_day_close, on="code", how="left")
 
     missing_prices = (
@@ -650,9 +606,6 @@ def apply_prev_close_fill(result: pd.DataFrame, raw_tick: pd.DataFrame, prev_day
 
 
 def normalize_output_types(result: pd.DataFrame) -> pd.DataFrame:
-    """
-    最终统一输出类型，尽量贴近聚宽 parquet 的数值表现。
-    """
     result = result.copy()
     for col in ["open", "close", "high", "low"]:
         result[col] = pd.to_numeric(result[col], errors="coerce").astype(np.float32)
@@ -699,21 +652,34 @@ def generate_1m_bars(
 def main() -> None:
     args = parse_args()
     base_dir = Path(__file__).resolve().parent
-    tick_path, universe_path, output_path = resolve_paths(base_dir, args)
-    prev_1m_dir = Path(args.prev_1m_dir) if args.prev_1m_dir else base_dir / "jq_data" / "price_1m"
+    tick_dir = Path(args.tick_dir)
+    prev_1m_dir = Path(args.prev_1m_dir)
 
-    tick = load_tick(tick_path, args.code)
+    if args.output_path:
+        output_path = Path(args.output_path)
+    else:
+        output_path = base_dir / f"generated_1m_ht_{args.date}.parquet"
+
+    if args.universe_path:
+        universe_path = Path(args.universe_path)
+    else:
+        default_universe = prev_1m_dir / f"{args.date}.parquet"
+        universe_path = default_universe if default_universe.exists() else None
+
+    print(f"Loading Huatai tick data from {tick_dir / args.date} ...")
+    tick = load_ht_tick(tick_dir, args.date, args.code)
+    print(f"  tick rows: {len(tick)}, codes: {tick['code'].nunique()}")
+
     prev_day_close = load_prev_day_close(prev_1m_dir, args.date, args.code)
     codes = load_universe_codes(tick, universe_path, prev_day_close, args.code)
     if not codes:
         raise ValueError("没有可生成的股票代码。请检查 tick 文件、universe_path 或 code 参数。")
+    print(f"  universe codes: {len(codes)}")
 
     result = generate_1m_bars(tick, prev_day_close, codes, args.date)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result.to_parquet(output_path, index=False)
 
-    print(f"tick_path={tick_path}")
-    print(f"universe_path={universe_path}")
     print(f"output_path={output_path}")
     print(f"rows={len(result)}")
     print(result.head(10).to_string(index=False))

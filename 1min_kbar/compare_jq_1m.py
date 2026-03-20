@@ -301,6 +301,71 @@ def select_price_ticks(
     return price_ticks
 
 
+def apply_morning_end_rule(
+    result: pd.DataFrame,
+    raw_tick: pd.DataFrame,
+    date_str: str,
+    ignore_nonpositive_current: bool,
+) -> pd.DataFrame:
+    """
+    11:30 边界特殊处理。
+
+    当 11:30 bar 内 11:30:00 之前没有成交（bar 内所有快照 volume 不变），
+    聚宽会用 11:30:00 之前的静态快照价格作为 open，而不是 11:30:00 的成交价。
+    """
+    morning_end_dt = pd.Timestamp(f"{date_str} {MORNING_END}")
+    bar_start = morning_end_dt - pd.Timedelta(minutes=1)
+
+    raw = raw_tick.sort_values(["code", "datetime"], kind="stable").copy()
+
+    pre_end = raw[
+        (raw["datetime"] >= bar_start)
+        & (raw["datetime"] < morning_end_dt)
+    ]
+    if ignore_nonpositive_current:
+        pre_end = pre_end[pre_end["current"] > 0]
+    if pre_end.empty:
+        return result
+
+    vol_agg = pre_end.groupby("code", sort=False)["volume"].agg(["first", "last"])
+    no_trade_codes = set(vol_agg[vol_agg["first"] == vol_agg["last"]].index)
+    if not no_trade_codes:
+        return result
+
+    first_snapshot = (
+        pre_end[pre_end["code"].isin(no_trade_codes)]
+        .groupby("code", sort=False)["current"]
+        .first()
+        .reset_index()
+        .rename(columns={"current": "snapshot_open"})
+    )
+
+    bar_11_30 = result[result["datetime"] == morning_end_dt].copy()
+    bar_11_30 = bar_11_30.merge(first_snapshot, on="code", how="inner")
+
+    need_fix = bar_11_30[
+        ~np.isclose(
+            bar_11_30["open"].astype(np.float64),
+            bar_11_30["snapshot_open"].astype(np.float64),
+            atol=1e-6,
+        )
+    ]
+    if need_fix.empty:
+        return result
+
+    override = need_fix[["datetime", "code", "snapshot_open", "close"]].copy()
+    close_f64 = override["close"].astype(np.float64)
+    snap_f64 = override["snapshot_open"].astype(np.float64)
+    override["open"] = snap_f64
+    override["high"] = np.maximum(snap_f64, close_f64)
+    override["low"] = np.minimum(snap_f64, close_f64)
+    override = override[["datetime", "code", "open", "high", "low"]]
+
+    result = result.set_index(["datetime", "code"])
+    result.update(override.set_index(["datetime", "code"]))
+    return result.reset_index()
+
+
 def apply_close_auction_bar(
     result: pd.DataFrame,
     raw_tick: pd.DataFrame,
@@ -572,6 +637,7 @@ def synthesize_bars(
     for col in ["open", "close", "high", "low", "money", "volume"]:
         result[col] = pd.to_numeric(result[col], errors="coerce")
     if carry_session_end_tick:
+        result = apply_morning_end_rule(result, raw_tick, date_str, ignore_nonpositive_current)
         result = apply_close_auction_bar(result, raw_tick, date_str, ignore_nonpositive_current)
     result = apply_prev_day_close_fill(result, raw_tick, prev_day_close, date_str)
     for col in ["open", "close", "high", "low"]:
