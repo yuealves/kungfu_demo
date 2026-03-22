@@ -57,6 +57,25 @@ void* LocalJournalPage::getFrameData(LocalFrameHeader* header) {
     return (void*)((char*)header + sizeof(LocalFrameHeader));
 }
 
+// 从文件名中提取 page number: "yjj.<name>.<page_num>.journal" → page_num
+static int extract_page_num(const std::string& filepath) {
+    // 找最后一个 '/' 后的文件名
+    auto slash = filepath.rfind('/');
+    std::string fname = (slash != std::string::npos) ? filepath.substr(slash + 1) : filepath;
+    // "yjj.xxx.123.journal" → 找第二个 '.' 和第三个 '.' 之间的数字
+    auto first_dot = fname.find('.');
+    if (first_dot == std::string::npos) return 0;
+    auto second_dot = fname.find('.', first_dot + 1);
+    if (second_dot == std::string::npos) return 0;
+    auto third_dot = fname.find('.', second_dot + 1);
+    if (third_dot == std::string::npos) return 0;
+    try {
+        return std::stoi(fname.substr(second_dot + 1, third_dot - second_dot - 1));
+    } catch (...) {
+        return 0;
+    }
+}
+
 std::vector<std::string> getJournalFiles(const std::string& dir, const std::string& jname) {
     std::vector<std::string> files;
     DIR* d = opendir(dir.c_str());
@@ -74,6 +93,10 @@ std::vector<std::string> getJournalFiles(const std::string& dir, const std::stri
     }
     closedir(d);
 
-    std::sort(files.begin(), files.end());
+    // 按 page number 数字排序（不是字典序！）
+    std::sort(files.begin(), files.end(),
+        [](const std::string& a, const std::string& b) {
+            return extract_page_num(a) < extract_page_num(b);
+        });
     return files;
 }

@@ -72,7 +72,7 @@ struct LocalPageHeader {
 } __attribute__((packed));                   // 合计 137 字节
 ```
 
-### 2.2 Frame Header（帧头���38 字节）
+### 2.2 Frame Header（帧头，38 字节）
 
 ```c
 // journal_reader.h:23-34
@@ -157,7 +157,7 @@ Gateway 从 Insight SDK 接收 Protobuf `MarketData.mdstock()` 消息（`insight
 **`StockTickData.ParseFrom()` 转换逻辑**（`insight_types.h:258-324`）：
 
 ```
-htscsecurityid  →  截取数字��分 → Symbol (int32)        // :260
+htscsecurityid  →  截取数字部分 → Symbol (int32)        // :260
                    例: "000001.SZ" → 1, "600000.SH" → 600000
 mdtime          →  Time (int32，保持 HHMMSSmmm 格式)    // :277
 totalvaluetrade →  AccTurnover (int64)                   // :262
@@ -187,7 +187,7 @@ symbol          →  Symbol (int32)                        // :282
 0 (构造函数体内) → BizIndex (int32)                      // data_struct.hpp:218
 ```
 
-> **注意**：Insight SDK 的价格/金额字段为 long 整数（含精度倍率），gateway 转换时直接 `static_cast<float>` 截���，**未做除法还原小数**。上游使用时需注意价格单位。`TotalAskVolume` 和 `TotalBidVolume` 除以了 1000。`Turnover`、`Volume` 被硬编码为 0（gateway 构造函数参数位置问题）。`BizIndex` 在构造函数体内被设为 0。
+> **注意**：Insight SDK 的价格/金额字段为 long 整数（含精度倍率），gateway 转换时直接 `static_cast<float>` 截断，**未做除法还原小数**。上游使用时需注意价格单位。`TotalAskVolume` 和 `TotalBidVolume` 除以了 1000。`Turnover`、`Volume` 被硬编码为 0（gateway 构造函数参数位置问题）。`BizIndex` 在构造函数体内被设为 0。
 
 ### 3.2 KyStdSnpType 结构体（Journal 中的二进制布局）
 
@@ -546,7 +546,40 @@ Parquet schema 定义于 `parquet_writer.cpp:319-336`，写入逻辑于 `parquet
 
 ---
 
-## 9. Parquet 文件规格
+## 9. 并行读取的有序性保证
+
+归档程序使用多线程并行读取 journal 文件以提高速度，同时**不做任何排序**，完全保持 journal 中 `nano_timestamp` 的原始写入顺序。有序性通过以下机制保证：
+
+```
+Journal 文件（已按 page number 数字排序）:
+  page 0    page 1    page 2    page 3    page 4    page 5
+  [t0─t1]   [t1─t2]   [t2─t3]   [t3─t4]   [t4─t5]   [t5─t6]
+  ╰── thread 0 ──────╯  ╰── thread 1 ──────╯  ╰── thread 2 ──────╯
+
+各线程局部 vector:
+  thread 0: [t0 ... t2]    ← 内部有序（按文件顺序逐帧读取）
+  thread 1: [t2 ... t4]    ← 内部有序
+  thread 2: [t4 ... t6]    ← 内部有序
+
+拼接（按 thread 0, 1, 2 顺序）:
+  [t0 ... t2 | t2 ... t4 | t4 ... t6]  → 全局有序 ✓
+```
+
+**四个关键环节**：
+
+1. **文件排序**（`journal_reader.cpp: getJournalFiles()`）：按 page number **数字排序**，确保 `page 1, 2, ..., 9, 10, 11` 而非字典序的 `1, 10, 11, 2, ...`。这是有序性的基础。
+
+2. **连续分块**（`main.cpp: read_journal_parallel()`）：文件列表按 thread id 均分为连续块——thread 0 读 page 0~N，thread 1 读 page N+1~2N...。每个线程的时间范围不重叠。
+
+3. **顺序读取**：每个线程内按文件顺序逐页逐帧读取到局部 vector，保持 journal 原始顺序。
+
+4. **有序拼接**：合并时按 thread 0, 1, 2... 顺序拼接各局部 vector，等价于单线程从头到尾顺序读取。
+
+**设计原则**：程序不对数据做任何排序。如果输出 parquet 中出现 `nano_timestamp` 乱序，说明上游 journal 写入有问题，应排查线上 gateway，而非在归档侧掩盖问题。
+
+---
+
+## 10. Parquet 文件规格
 
 | 属性 | 值 | 代码位置 |
 |------|-----|---------|
@@ -568,7 +601,7 @@ Parquet schema 定义于 `parquet_writer.cpp:319-336`，写入逻辑于 `parquet
 
 ---
 
-## 10. 源码文件对照
+## 11. 源码文件对照
 
 ### Gateway 侧（写入 journal）
 

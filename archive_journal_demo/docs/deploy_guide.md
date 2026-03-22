@@ -58,7 +58,7 @@ cmake .. && make -j$(nproc)
 
 ## 使用
 
-### 命令行参���
+### 命令行参数
 
 ```
 ./archive_journal -i <journal_dir> [-o <output_dir>] [-s <target_mb>] [-t <threads>]

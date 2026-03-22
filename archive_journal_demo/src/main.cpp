@@ -6,7 +6,6 @@
 
 #include <arrow/util/thread_pool.h>
 
-#include <atomic>
 #include <chrono>
 #include <ctime>
 #include <iomanip>
@@ -41,8 +40,16 @@ static std::string today_cst() {
 }
 
 // ---------------------------------------------------------------------------
-// 多线程并行读取 journal 文件的通用模板
-// Work-stealing: 每个线程原���地取下一个文件，读到线程局部 vector，最后合并
+// 多线程并行读取 journal 文件
+//
+// 有序性保证：
+//   1. getJournalFiles() 按 page number 数字排序（非字典序），保证文件列表与 journal 写入顺序一致
+//   2. 文件列表按 tid 均分为连续块，thread 0 读前 N 个文件，thread 1 读接下来 N 个...
+//   3. 每个线程内部按文件顺序逐页逐帧读取，局部 vector 保持 journal 原始顺序
+//   4. 合并时按 thread 0, 1, 2... 顺序拼接，等价于单线程从头到尾读取
+//
+// 因此输出 vector 严格保持 journal 中 nano_timestamp 的原始写入顺序，不做任何排序。
+// 如果输出 parquet 出现乱序，说明 journal 源头写入有问题，应排查线上 gateway。
 // ---------------------------------------------------------------------------
 template<typename RecordT, typename StructT, typename ConvertFn>
 static std::vector<RecordT> read_journal_parallel(
@@ -60,15 +67,11 @@ static std::vector<RecordT> read_journal_parallel(
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // 每个线程一个局部 vector，避免锁争用
     std::vector<std::vector<RecordT>> thread_results(actual_threads);
-    std::atomic<size_t> next_file{0};
-    std::atomic<size_t> done_count{0};
     std::mutex cout_mtx;
 
     auto worker = [&](int tid) {
         auto& local = thread_results[tid];
-        // 每个线程顺序读取一段连续的文件，避免 fetch_add 导致的乱序
         size_t num_files = files.size();
         size_t files_per_thread = (num_files + actual_threads - 1) / actual_threads;
         size_t start = tid * files_per_thread;
@@ -109,7 +112,7 @@ static std::vector<RecordT> read_journal_parallel(
         for (auto& t : threads) t.join();
     }
 
-    // 合并各线程结果
+    // 合并各线程结果（文件已按 page number 数字排序，各线程读取连续页，拼接后自然有序）
     size_t total = 0;
     for (auto& v : thread_results) total += v.size();
 
