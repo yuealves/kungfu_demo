@@ -1,4 +1,10 @@
-# KBar Builder — 实时 1 分钟 K 线聚合模块
+# KBar Builder — 实时 1 分钟 K 线聚合模块（已废弃）
+
+> **本文档已过时。** 此处描述的是早期基于 trade 数据、嵌入 `realtime_parquet` 进程的 kbar 实现。该实现已从 `realtime_parquet` 中移除（`realtime_parquet` 现在只负责 dump parquet）。
+>
+> 当前使用的 kbar 实现基于 **tick 快照**合成聚宽口径 1min K 线，作为独立子项目运行。文档见 **[`realtime_kbar/README.md`](../realtime_kbar/README.md)**。
+>
+> 以下内容仅作历史参考，记录早期基于 trade + watermark 的设计思路。
 
 ## 背景
 
@@ -6,7 +12,7 @@
 
 选择 CSV 而非 Parquet：每分钟约 5000 行（全市场活跃股票数），Parquet 的列式压缩优势在此量级下可忽略，CSV 代码更简单、可直接 `cat` 查看。
 
-源码：`realtime_parquet/src/kbar_builder.h`、`realtime_parquet/src/kbar_builder.cpp`。
+~~源码：`realtime_parquet/src/kbar_builder.h`、`realtime_parquet/src/kbar_builder.cpp`。~~（已删除）
 
 ---
 
@@ -300,18 +306,6 @@ CSV 行按 symbol 数值升序排列，保证输出确定性。
 
 ---
 
-## 10. 与主循环的集成
+## 10. ~~与主循环的集成~~（已移除）
 
-在 `main.cpp` 中只增加了 5 行代码：
-
-```cpp
-#include "kbar_builder.h"                           // 头文件
-
-KBarBuilder kbar_builder(output_dir);               // 构造（启动线程）
-
-kbar_builder.set_date(current_date);                // 日期切换时通知 kbar 线程
-
-kbar_builder.push_trade(md, nano);                  // trade 数据入队
-
-kbar_builder.stop();                                // 退出时等待 kbar 线程结束
-```
+kbar 功能已从 `realtime_parquet` 中移除。现在 kbar 由独立的 `realtime_kbar` 进程负责，两者可同时通过 Paged 读取 journal，互不影响。

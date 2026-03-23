@@ -355,6 +355,15 @@ void StockBarAccumulator::finalize() {
     }
 }
 
+void StockBarAccumulator::finalize_current_only() {
+    if (finalized_) return;
+    finalized_ = true;
+
+    if (current_bar_ > 0) {
+        emit_bar();
+    }
+}
+
 bool StockBarAccumulator::pop_bar(MinuteBar& out) {
     if (completed_bars_.empty()) return false;
     out = completed_bars_.front();
@@ -391,6 +400,13 @@ void TickBarBuilder::add_symbol(int32_t symbol) {
 void TickBarBuilder::finalize_all() {
     for (auto& [sym, acc] : accumulators_) {
         acc.finalize();
+        if (callback_) drain_bars(sym, acc);
+    }
+}
+
+void TickBarBuilder::finalize_all_current_only() {
+    for (auto& [sym, acc] : accumulators_) {
+        acc.finalize_current_only();
         if (callback_) drain_bars(sym, acc);
     }
 }

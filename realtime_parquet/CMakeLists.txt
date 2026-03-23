@@ -54,7 +54,6 @@ LINK_DIRECTORIES(${KUNGFU_LIB_DIR})
 add_executable(realtime_parquet
     src/main.cpp
     src/minute_writer.cpp
-    src/kbar_builder.cpp
 )
 
 target_include_directories(realtime_parquet PRIVATE src)

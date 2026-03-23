@@ -117,7 +117,7 @@ int main(int argc, const char* argv[])
     if (argc > 1) speed = std::atof(argv[1]);
     if (speed <= 0) speed = 1.0;
 
-    std::string src_path = std::string(PROJECT_ROOT_DIR) + "/deps/new_journal_data/";
+    std::string src_path = std::string(PROJECT_ROOT_DIR) + "/deps/data/";
     std::string dst_dir = "/shared/kungfu/journal/user/";
     std::string writer_name = "journal_replayer";
 

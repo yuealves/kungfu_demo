@@ -33,6 +33,9 @@ public:
     // Finalize: emit current bar and fill all remaining trading minutes.
     void finalize();
 
+    // Finalize without gap-filling: only emit the current in-progress bar.
+    void finalize_current_only();
+
     // Pop a completed bar. Returns false if queue is empty.
     bool pop_bar(MinuteBar& out);
 
@@ -138,6 +141,7 @@ public:
     void add_symbol(int32_t symbol);
 
     void finalize_all();
+    void finalize_all_current_only();  // finalize without carry-forward gap filling
 
     // Get all completed bars for a symbol (after finalize)
     std::vector<MinuteBar> get_bars(int32_t symbol);
