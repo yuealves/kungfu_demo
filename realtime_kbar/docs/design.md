@@ -304,14 +304,14 @@ patch 只写被更新的股票，常见情况有两类：
 
 ## 10. 日志语义
 
-当前实现的核心日志有三类。
+当前实现的核心日志有四类。
 
 ### 10.1 主文件发布日志
 
 示例：
 
 ```text
-[minute_publish] minute=0931 status=preliminary version=1 trigger=sec01_flush stocks_published=5229
+[minute_publish] minute=0931 status=preliminary version=1 trigger=sec01_flush stocks_published=5191 symbols_seen_total=5191 missing_vs_seen=0 path=2026-03-17/kbar_0931.csv preliminary_minutes_total=1
 ```
 
 含义：
@@ -320,21 +320,55 @@ patch 只写被更新的股票，常见情况有两类：
 - `version=1`：主文件版本
 - `trigger=sec01_flush`：由 SH 的 `01` 秒触发
 - `stocks_published`：主文件行数
+- `symbols_seen_total`：当前已见过的 symbol 总数
+- `missing_vs_seen`：主文件相对当前 symbol universe 还缺多少行
+- `path`：输出文件路径
+- `preliminary_minutes_total`：当前累计发布的主文件分钟数
 
 ### 10.2 Patch 日志
 
 示例：
 
 ```text
-[minute_patch] minute=0932 version=3 dirty_symbols=1
+[minute_patch] minute=1444 version=4 symbols=1 insert=1 update=0 finalize_symbols=0 flush_source=timer since_prelim_ms=3135 dirty_wait_ms=1000 path=2026-03-23/kbar_patch_1444_v4.csv samples=002485.XSHE:insert:vol=0:tick_time=144459000:nano=1774257843123456789:delay_ms=43123 patch_files_total=119
 ```
 
 含义：
 
-- `version`：patch 版本号
-- `dirty_symbols`：本次 patch 覆盖的股票数量
+- `symbols`：本次 patch 覆盖的股票数量
+- `insert`：主文件里原本没有，后面才补出的 bar 数量
+- `update`：主文件里已有，但数值后来又发生变化的 bar 数量
+- `finalize_symbols`：这批 patch 中，有多少 symbol 是在 `finalize` 阶段才变脏的
+- `flush_source=timer`：表示这是正常 1 秒节流窗口到期后写出的 patch
+- `flush_source=finalize`：表示这是进程退出 / 收盘收尾时一次性写出的 patch
+- `since_prelim_ms`：距离该分钟主文件首次发布经过了多久
+- `dirty_wait_ms`：该波 dirty 数据在内存里累计了多久后被写成 patch
+- `samples`：最多展示 5 个样本 symbol，格式为 `code:insert|update:vol=...:tick_time=...:nano=...:delay_ms=...[:finalize]`
+- `patch_files_total`：当前进程累计输出的 patch 文件数
 
-### 10.3 Finalize 日志
+通过这条日志，可以直接判断某个 patch 为什么产生：
+
+- 如果 `insert>0` 且样本类似 `002485.XSHE:insert:vol=0:tick_time=144459000:nano=...:delay_ms=43123`，通常表示主文件发布时这只股票该分钟 bar 还不存在，后面才被一条晚到约 43 秒的 tick 补出一根 0 成交量 bar
+- 如果 `update>0`，说明主文件里已有该分钟 bar，但后面又被迟到 tick 改写
+- 如果 `finalize_symbols` 很大，通常说明这批 patch 主要来自收盘收尾而不是盘中迟到
+
+### 10.3 进度日志
+
+示例：
+
+```text
+[progress] ticks=22000000 symbols_seen=5191 preliminary_minutes=226 patch_files=119 out_of_order_rebuilds=0
+```
+
+含义：
+
+- `ticks`：累计处理的 tick 数
+- `symbols_seen`：当前已见过的 symbol 数
+- `preliminary_minutes`：累计发布的主文件分钟数
+- `patch_files`：累计 patch 文件数
+- `out_of_order_rebuilds`：乱序 tick 触发的单 symbol 重放次数
+
+### 10.4 Finalize 日志
 
 如果某分钟直到进程结束都还没被 `sec01_flush` 触发，则在退出时会看到：
 
@@ -342,10 +376,16 @@ patch 只写被更新的股票，常见情况有两类：
 [minute_publish] minute=0957 status=preliminary version=1 trigger=finalize stocks_published=5207
 ```
 
+同时，若某分钟在收尾阶段仍有未刷新的 dirty 数据，对应 patch 会带：
+
+```text
+flush_source=finalize
+```
+
 这表示：
 
-- 该分钟没有等到正常的 `sec01_flush`
-- 最终由 `finalize_all()` 输出
+- 该分钟没有等到正常的 `sec01_flush`，或虽然已经发布但还有收尾修正
+- 最终由 `finalize_all()` 统一输出
 
 ## 11. 当前已验证结论
 

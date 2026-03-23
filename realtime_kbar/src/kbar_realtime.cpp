@@ -30,6 +30,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -102,6 +103,28 @@ static bool bar_equal(const MinuteBar& a, const MinuteBar& b) {
            std::fabs(a.volume - b.volume) < 1e-6 &&
            std::fabs(a.money - b.money) < 1e-6;
 }
+static int64_t local_date_time_to_nano(const std::string& date, int32_t time_int) {
+    if (date.size() != 10 || time_int <= 0) return 0;
+
+    struct tm t = {};
+    t.tm_year = std::stoi(date.substr(0, 4)) - 1900;
+    t.tm_mon = std::stoi(date.substr(5, 2)) - 1;
+    t.tm_mday = std::stoi(date.substr(8, 2));
+    t.tm_hour = time_int / 10000000;
+    t.tm_min = (time_int / 100000) % 100;
+    t.tm_sec = (time_int / 1000) % 100;
+    int ms = time_int % 1000;
+
+    time_t sec = mktime(&t);
+    if (sec < 0) return 0;
+    return (int64_t)sec * 1000000000LL + (int64_t)ms * 1000000LL;
+}
+
+struct DirtySymbolMeta {
+    int64_t first_nano = 0;
+    int32_t first_tick_time = 0;
+    bool from_finalize = false;
+};
 
 struct RawTick {
     int32_t time = 0;
@@ -126,6 +149,7 @@ struct MinutePublishState {
     int64_t prelim_publish_ns = 0;
     std::map<int32_t, MinuteBar> published_snapshot;
     std::unordered_set<int32_t> dirty_symbols;
+    std::unordered_map<int32_t, DirtySymbolMeta> dirty_meta;
     int64_t dirty_since_ns = 0;
 };
 
@@ -199,18 +223,6 @@ private:
 
         fclose(fp);
         std::rename(tmp_path.c_str(), final_path.c_str());
-
-        if (is_patch) {
-            std::cout << "[minute_patch] minute=" << minute_str
-                      << " version=" << version
-                      << " dirty_symbols=" << (int)sym_bars.size()
-                      << " path=" << final_path << std::endl;
-        } else {
-            std::cout << "[minute_publish] minute=" << minute_str
-                      << " version=1"
-                      << " stocks=" << (int)sym_bars.size()
-                      << " path=" << final_path << std::endl;
-        }
     }
 };
 
@@ -228,6 +240,7 @@ public:
     int patched_symbol_total() const { return patched_symbol_total_; }
 
     using SnapshotProvider = std::function<std::map<int32_t, MinuteBar>(int)>;
+    using SymbolCountProvider = std::function<int()>;
 
     explicit MinutePublishCoordinator(const std::string& output_dir)
         : writer_(output_dir) {}
@@ -241,7 +254,11 @@ public:
         snapshot_provider_ = std::move(provider);
     }
 
-    void on_bar_upsert(int32_t symbol, const MinuteBar& bar, int64_t nano) {
+    void set_symbol_count_provider(SymbolCountProvider provider) {
+        symbol_count_provider_ = std::move(provider);
+    }
+
+    void on_bar_upsert(int32_t symbol, const MinuteBar& bar, int64_t nano, int32_t source_tick_time) {
         auto& latest = latest_by_minute_[bar.bar_minute];
         latest[symbol] = bar;
 
@@ -251,7 +268,17 @@ public:
             bool changed = (it == st.published_snapshot.end()) || !bar_equal(it->second, bar);
             if (changed) {
                 st.dirty_symbols.insert(symbol);
-                if (st.dirty_since_ns == 0) st.dirty_since_ns = nano;
+                auto meta_it = st.dirty_meta.find(symbol);
+                if (meta_it == st.dirty_meta.end()) {
+                    DirtySymbolMeta meta;
+                    meta.first_nano = nano;
+                    meta.first_tick_time = source_tick_time;
+                    meta.from_finalize = (nano == 0);
+                    st.dirty_meta.emplace(symbol, meta);
+                } else if (nano == 0) {
+                    meta_it->second.from_finalize = true;
+                }
+                if (st.dirty_since_ns == 0 && nano > 0) st.dirty_since_ns = nano;
             }
         }
     }
@@ -275,7 +302,7 @@ public:
 
         for (auto& [minute, st] : minute_states_) {
             if (st.status == PublishStatus::PRELIM_PUBLISHED && !st.dirty_symbols.empty()) {
-                flush_patch(minute, st);
+                flush_patch(minute, st, /*flush_nano=*/0, "finalize");
             }
         }
     }
@@ -285,6 +312,7 @@ private:
 
     CsvPublishWriter writer_;
     SnapshotProvider snapshot_provider_;
+    SymbolCountProvider symbol_count_provider_;
     std::string current_date_;
     std::map<int, std::map<int32_t, MinuteBar>> latest_by_minute_;
     std::map<int, MinutePublishState> minute_states_;
@@ -298,7 +326,7 @@ private:
             if (st.dirty_symbols.empty()) continue;
             if (st.dirty_since_ns == 0) continue;
             if (nano - st.dirty_since_ns < PATCH_FLUSH_NS) continue;
-            flush_patch(minute, st);
+            flush_patch(minute, st, nano, "timer");
         }
     }
 
@@ -325,29 +353,74 @@ private:
 
         char minute_str[8];
         snprintf(minute_str, sizeof(minute_str), "%04d", minute);
+        int symbols_seen_total = symbol_count_provider_ ? symbol_count_provider_() : -1;
+        int missing_vs_seen = (symbols_seen_total >= 0) ? (symbols_seen_total - (int)snapshot.size()) : -1;
         std::cout << "[minute_publish] minute=" << minute_str
                   << " status=preliminary"
                   << " version=1"
                   << " trigger=" << trigger
-                  << " stocks_published=" << (int)snapshot.size()
+                  << " stocks_published=" << (int)snapshot.size();
+        if (symbols_seen_total >= 0) {
+            std::cout << " symbols_seen_total=" << symbols_seen_total
+                      << " missing_vs_seen=" << missing_vs_seen;
+        }
+        std::cout << " path=" << current_date_ << "/kbar_" << minute_str << ".csv"
                   << " preliminary_minutes_total=" << preliminary_publish_count_
                   << std::endl;
     }
 
-    void flush_patch(int minute, MinutePublishState& st) {
+    void flush_patch(int minute, MinutePublishState& st, int64_t flush_nano, const char* flush_source) {
         std::map<int32_t, MinuteBar> patch_bars;
         auto latest_it = latest_by_minute_.find(minute);
         if (latest_it == latest_by_minute_.end()) return;
 
+        int insert_count = 0;
+        int update_count = 0;
+        int finalize_symbol_count = 0;
+        std::vector<std::string> sample_changes;
+        sample_changes.reserve(5);
+
         for (int32_t sym : st.dirty_symbols) {
             auto bar_it = latest_it->second.find(sym);
             if (bar_it == latest_it->second.end()) continue;
+
+            auto snapshot_it = st.published_snapshot.find(sym);
+            bool is_insert = (snapshot_it == st.published_snapshot.end());
+            bool changed = is_insert || !bar_equal(snapshot_it->second, bar_it->second);
+            if (!changed) continue;
+
             patch_bars[sym] = bar_it->second;
             st.published_snapshot[sym] = bar_it->second;
+
+            if (is_insert) {
+                insert_count += 1;
+            } else {
+                update_count += 1;
+            }
+            auto meta_it = st.dirty_meta.find(sym);
+            bool from_finalize = (meta_it != st.dirty_meta.end() && meta_it->second.from_finalize);
+            if (from_finalize) finalize_symbol_count += 1;
+            if (sample_changes.size() < 5) {
+                std::ostringstream oss;
+                oss << format_symbol(sym) << ':' << (is_insert ? "insert" : "update")
+                    << ":vol=" << (long long)std::llround(bar_it->second.volume);
+                if (meta_it != st.dirty_meta.end() && meta_it->second.first_tick_time > 0) {
+                    int64_t event_nano = local_date_time_to_nano(current_date_, meta_it->second.first_tick_time);
+                    int64_t delay_ms = (meta_it->second.first_nano > 0 && event_nano > 0)
+                        ? (meta_it->second.first_nano - event_nano) / 1000000LL
+                        : -1;
+                    oss << ":tick_time=" << meta_it->second.first_tick_time
+                        << ":nano=" << meta_it->second.first_nano;
+                    if (delay_ms >= 0) oss << ":delay_ms=" << delay_ms;
+                }
+                if (from_finalize) oss << ":finalize";
+                sample_changes.push_back(oss.str());
+            }
         }
 
         if (patch_bars.empty()) {
             st.dirty_symbols.clear();
+            st.dirty_meta.clear();
             st.dirty_since_ns = 0;
             return;
         }
@@ -357,12 +430,40 @@ private:
         patch_file_count_ += 1;
         patched_symbol_total_ += (int)patch_bars.size();
         writer_.write_patch(minute, st.version, patch_bars);
-        std::cout << "[minute_patch] minute=" << minute
+
+        int64_t since_prelim_ms = -1;
+        if (flush_nano > 0 && st.prelim_publish_ns > 0) {
+            since_prelim_ms = (flush_nano - st.prelim_publish_ns) / 1000000LL;
+        }
+        int64_t dirty_wait_ms = -1;
+        if (flush_nano > 0 && st.dirty_since_ns > 0) {
+            dirty_wait_ms = (flush_nano - st.dirty_since_ns) / 1000000LL;
+        }
+
+        char minute_str[8];
+        snprintf(minute_str, sizeof(minute_str), "%04d", minute);
+        std::string patch_path = current_date_ + "/kbar_patch_" + minute_str + "_v" + std::to_string(st.version) + ".csv";
+        std::cout << "[minute_patch] minute=" << minute_str
                   << " version=" << st.version
-                  << " dirty_symbols=" << (int)patch_bars.size()
-                  << " patch_files_total=" << patch_file_count_
+                  << " symbols=" << (int)patch_bars.size()
+                  << " insert=" << insert_count
+                  << " update=" << update_count
+                  << " finalize_symbols=" << finalize_symbol_count
+                  << " flush_source=" << flush_source;
+        if (since_prelim_ms >= 0) std::cout << " since_prelim_ms=" << since_prelim_ms;
+        if (dirty_wait_ms >= 0) std::cout << " dirty_wait_ms=" << dirty_wait_ms;
+        std::cout << " path=" << patch_path;
+        if (!sample_changes.empty()) {
+            std::cout << " samples=";
+            for (size_t i = 0; i < sample_changes.size(); ++i) {
+                if (i) std::cout << ',';
+                std::cout << sample_changes[i];
+            }
+        }
+        std::cout << " patch_files_total=" << patch_file_count_
                   << std::endl;
         st.dirty_symbols.clear();
+        st.dirty_meta.clear();
         st.dirty_since_ns = 0;
     }
 };
@@ -540,6 +641,9 @@ int main(int argc, const char* argv[]) {
     coordinator.set_snapshot_provider([&](int minute) {
         return build_minute_snapshot(symbols, minute);
     });
+    coordinator.set_symbol_count_provider([&]() {
+        return (int)symbols.size();
+    });
     bool has_data = false;
     std::string current_date;
     long tick_count = 0;
@@ -550,7 +654,7 @@ int main(int argc, const char* argv[]) {
     auto do_finalize = [&]() {
         for (auto& [symbol, state] : symbols) {
             finalize_symbol_state(state, [&](const MinuteBar& bar) {
-                coordinator.on_bar_upsert(symbol, bar, /*nano=*/0);
+                coordinator.on_bar_upsert(symbol, bar, /*nano=*/0, /*source_tick_time=*/0);
             });
         }
         coordinator.finalize_all();
@@ -632,7 +736,7 @@ int main(int argc, const char* argv[]) {
         }
 
         process_symbol_tick(state, tick, [&](const MinuteBar& bar) {
-            coordinator.on_bar_upsert(md->Symbol, bar, nano);
+            coordinator.on_bar_upsert(md->Symbol, bar, nano, tick.time);
         });
         coordinator.on_sh_tick(md->Symbol, md->Time, nano);
 
