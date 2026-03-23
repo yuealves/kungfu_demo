@@ -103,7 +103,7 @@ df.to_parquet("/tmp/jq_1m/2026-03-17.parquet", compression="snappy")
 
 ## 5. kbar_realtime 用法
 
-线上实时工具：通过 Paged 读取 journal 中的 tick 数据，流式合成 kbar，每分钟输出一个 CSV 文件。
+线上实时工具：通过 Paged 读取 journal 中的 tick 数据，流式合成 JQ 口径分钟 bar，并按 `sec01_flush + patch` 模式对外发布。
 
 ```bash
 ./kbar_realtime [-o output_dir] [-d journal_dir] [-s now]
@@ -115,18 +115,38 @@ df.to_parquet("/tmp/jq_1m/2026-03-17.parquet", compression="snappy")
 | `-d` | `/shared/kungfu/journal/user/` | journal 目录 |
 | `-s now` | 从 journal 开头 | 只读取启动后的新数据 |
 
-**输出 CSV 格式**：
+### 5.1 发布逻辑
+
+当前实时发布逻辑很简单：
+
+- 使用 SH tick 作为主发布时间信号
+- 当 SH 的 `exchange_time` 进入某个交易分钟的 `01` 秒时，立即发布该分钟主文件
+- 如果后续迟到 tick 继续影响该分钟，则输出 patch 文件修正
+
+也就是：
+
+- 主文件：`sec01_flush`
+- 修正：`patch`
+
+选择这个方案的原因是：
+
+- 交易所一轮 tick 推送不稳定，不能可靠地通过“这一轮已经覆盖所有股票”来触发 flush
+- `nano_timestamp` 和 `exchange_time` 不一致，因此也不能在 `exchange_time` 刚到 `00` 秒时就 flush
+- 基于 replay 数据，`01` 秒 flush 比 `00` 秒安全，同时仍保持很低延迟
+
+### 5.2 输出文件
 
 ```
 output/
 └── 2026-03-17/
     ├── kbar_0931.csv
-    ├── kbar_0932.csv
+    ├── kbar_patch_0932_v2.csv
+    ├── kbar_patch_0932_v3.csv
     ├── ...
     └── kbar_1500.csv
 ```
 
-每个 CSV 文件包含该分钟全市场所有活跃股票的 kbar：
+主文件示例：
 
 ```csv
 time,code,open,close,high,low,volume,money
@@ -134,13 +154,21 @@ time,code,open,close,high,low,volume,money
 2026-03-17 09:31:00,600519.XSHG,1810.0000,1812.5000,1813.0000,1809.0000,23456,42498750
 ```
 
-文件采用**原子写入**：先写 `.kbar_HHMM.csv`（dot 前缀临时文件），完成后 `rename` 为 `kbar_HHMM.csv`，下游不会读到写了一半的文件。
+patch 文件示例：
 
-**prev_day_close 自动获取**：kbar_realtime 从每条 tick 的 `PreClose` 字段自动提取昨日收盘价，无需外部文件。每只股票只在首次出现时提取一次。
+```csv
+time,code,open,close,high,low,volume,money,version
+2026-03-17 09:32:00,200028.XSHE,6.1200,6.1200,6.1200,6.1200,0,0,2
+```
 
-**信号处理**：SIGINT/SIGTERM 触发优雅退出（finalize 当天所有 bar + flush 剩余 CSV）。
+文件采用**原子写入**：先写 dot 前缀临时文件，完成后 `rename` 为正式文件，下游不会读到半写状态。
 
----
+### 5.3 实现要点
+
+- `prev_day_close` 从 tick 的 `PreClose` 字段自动提取，每只股票首次出现时初始化
+- 分钟发布层按“分钟保存所有股票状态”工作，已发布分钟后续仍可被 patch 修正
+- 对同一股票的乱序迟到 tick，会重放该股票全天 tick 历史，修正受影响分钟
+- SIGINT/SIGTERM 或空闲超时会触发 `finalize_all()`，补齐尚未发布的分钟并 flush 剩余 patch
 
 ## 6. 核心合成逻辑
 

@@ -444,8 +444,10 @@ std::string format_symbol(int32_t symbol) {
     char buf[24];
     if (symbol < 400000)
         snprintf(buf, sizeof(buf), "%06d.XSHE", symbol);
-    else
+    else if (symbol < 700000)
         snprintf(buf, sizeof(buf), "%06d.XSHG", symbol);
+    else
+        snprintf(buf, sizeof(buf), "%06d.OTHER", symbol);
     return buf;
 }
 
