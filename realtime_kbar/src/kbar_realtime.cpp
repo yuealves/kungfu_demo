@@ -65,8 +65,12 @@ static bool is_sh_symbol(int32_t symbol) {
     return symbol >= 400000 && symbol < 700000;
 }
 
+static bool is_excluded_non_target_symbol(int32_t symbol) {
+    return symbol >= 200000 && symbol < 202000;
+}
+
 static bool is_supported_symbol(int32_t symbol) {
-    return symbol >= 0 && symbol < 700000;
+    return symbol >= 0 && symbol < 700000 && !is_excluded_non_target_symbol(symbol);
 }
 
 static int hhmm_from_time(int32_t time_int) {

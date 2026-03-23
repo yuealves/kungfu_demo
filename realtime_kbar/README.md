@@ -134,6 +134,8 @@ df.to_parquet("/tmp/jq_1m/2026-03-17.parquet", compression="snappy")
 - `nano_timestamp` 和 `exchange_time` 不一致，因此也不能在 `exchange_time` 刚到 `00` 秒时就 flush
 - 基于 replay 数据，`01` 秒 flush 比 `00` 秒安全，同时仍保持很低延迟
 
+当前实现还会额外排除 `200xxx`、`201xxx` 这批非目标 symbol。原因是它们不在当前对齐使用的 JQ `price_1m` 股票 universe 内，而且会显著增加 patch 噪声。
+
 ### 5.2 输出文件
 
 ```
