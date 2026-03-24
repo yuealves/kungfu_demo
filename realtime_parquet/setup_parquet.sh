@@ -1,1 +1,1 @@
-../archive_journal_demo/setup_parquet.sh
+../archive_journal/setup_parquet.sh

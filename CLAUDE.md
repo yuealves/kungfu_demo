@@ -117,7 +117,7 @@ CMakeLists.txt 当前配置为 Docker 路径：
 
 ## 子项目
 
-### archive_journal_demo/（Journal 转 Parquet 归档工具）
+### archive_journal/（Journal 转 Parquet 归档工具）
 
 线上每日收盘后使用，读取当天的 journal 文件并转成 Parquet 格式存档。当前已在线上运行。
 
