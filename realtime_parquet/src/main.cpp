@@ -57,6 +57,16 @@ static int next_minute(int hhmm) {
     return h * 100 + m;
 }
 
+// 基于数据的 nanotime (HHMM)，计算它应该落入的目标文件标识
+static int get_target_file_hhmm(int data_hhmm) {
+    if (data_hhmm < 926) return 926;
+    if (data_hhmm < 931) return 931;
+    if (data_hhmm < 1131) return next_minute(data_hhmm);
+    if (data_hhmm < 1301) return 1301;
+    if (data_hhmm < 1501) return next_minute(data_hhmm);
+    return next_minute(data_hhmm);
+}
+
 // 从纳秒时间戳提取 YYYYMMDD 日期字符串
 static std::string nano_to_date(int64_t nano) {
     time_t sec = nano / 1000000000LL;
@@ -109,7 +119,7 @@ static int64_t exch_time_to_ms_of_day(int32_t exch_time) {
 struct ChannelCtx {
     const char* name;
     MinuteWriter writer;
-    int current_minute = -1;
+    int current_target_file = -1;
     long total_rows = 0;
     int64_t last_nano = 0;        // 最后一条数据的 nano_timestamp（线上=getNano, replay=extra_nano）
     int64_t last_read_wall = 0;   // 读到最后一条数据时的墙上时间
@@ -208,9 +218,9 @@ int main(int argc, const char* argv[])
         }
     };
 
-    auto rotate_channel = [&](ChannelCtx& ch, int minute, int64_t nano) {
+    auto rotate_channel = [&](ChannelCtx& ch, int target_file, int64_t nano) {
         // 关闭当前文件
-        if (ch.current_minute >= 0) {
+        if (ch.current_target_file >= 0) {
             ch.writer.close();
             // 落盘完成的墙上时间
             int64_t now_ns = getNanoTime();
@@ -236,7 +246,7 @@ int main(int argc, const char* argv[])
             int et_s = (et / 1000) % 100, et_ms = et % 1000;
 
             char ms[8];
-            snprintf(ms, sizeof(ms), "%04d", next_minute(ch.current_minute));
+            snprintf(ms, sizeof(ms), "%04d", ch.current_target_file);
             char nano_str[16], exch_str[16];
             snprintf(nano_str, sizeof(nano_str), "%02d:%02d:%02d.%03d",
                      last_tm.tm_hour, last_tm.tm_min, last_tm.tm_sec, last_ms);
@@ -255,15 +265,49 @@ int main(int argc, const char* argv[])
             ch.total_rows += ch.writer.row_count();
         }
 
-        // 打开新文件（以结束分钟命名：[09:30,09:31) 的数据 → tick_0931.parquet）
+        // 打开新文件
         ensure_dir(nano);
         char minute_str[8];
-        snprintf(minute_str, sizeof(minute_str), "%04d", next_minute(minute));
+        snprintf(minute_str, sizeof(minute_str), "%04d", target_file);
         ch.writer.open(current_dir + "/" + ch.name + "_" + minute_str + ".parquet");
-        ch.current_minute = minute;
+        ch.current_target_file = target_file;
     };
 
+    static int g_last_sys_hhmm = -1;
+
     while (g_running) {
+        // 系统时间跨越检测
+        time_t now = time(NULL) + 8 * 3600; // 东八区时间
+        struct tm sys_t;
+        gmtime_r(&now, &sys_t);
+        int curr_sys_hhmm = sys_t.tm_hour * 100 + sys_t.tm_min;
+
+        if (g_last_sys_hhmm == -1) {
+            g_last_sys_hhmm = curr_sys_hhmm;
+        }
+
+        if (g_last_sys_hhmm != curr_sys_hhmm) {
+            int target_flush = -1;
+            int next_file = -1;
+            
+            if (g_last_sys_hhmm < 926 && curr_sys_hhmm >= 926) { target_flush = 926; next_file = 931; }
+            else if (g_last_sys_hhmm < 931 && curr_sys_hhmm >= 931) { target_flush = 931; next_file = 932; }
+            else if (g_last_sys_hhmm < 1131 && curr_sys_hhmm >= 1131) { target_flush = 1131; next_file = 1301; }
+            else if (g_last_sys_hhmm < 1301 && curr_sys_hhmm >= 1301) { target_flush = 1301; next_file = 1302; }
+            else if (g_last_sys_hhmm < 1501 && curr_sys_hhmm >= 1501) { target_flush = 1501; next_file = 1502; }
+            
+            if (target_flush != -1) {
+                std::cout << "[sys] System time crossed " << target_flush 
+                          << " (to " << curr_sys_hhmm << "), force flush and rotate." << std::endl;
+                for (auto& ch : channels) {
+                    if (ch.current_target_file != -1 && ch.current_target_file <= target_flush) {
+                        int64_t flush_nano = ch.last_nano > 0 ? ch.last_nano : getNanoTime();
+                        rotate_channel(ch, next_file, flush_nano);
+                    }
+                }
+            }
+            g_last_sys_hhmm = curr_sys_hhmm;
+        }
         FramePtr frame = reader->getNextFrame();
 
         if (frame.get() == nullptr) {
@@ -288,13 +332,12 @@ int main(int argc, const char* argv[])
             continue;
         }
 
-        // 用 nano_timestamp 判断分钟切换（nano 严格递增，不受 exchange_time 乱序影响）
-        // nano 在线上 = frame->getNano()（写入时刻），replay = extra_nano（原始时刻）
-        int minute = nano_to_hhmm(nano);
+        int data_hhmm = nano_to_hhmm(nano);
+        int target_file = get_target_file_hhmm(data_hhmm);
         auto& ch = channels[idx];
 
-        if (minute != ch.current_minute) {
-            rotate_channel(ch, minute, nano);
+        if (target_file != ch.current_target_file) {
+            rotate_channel(ch, target_file, nano);
         }
 
         // 写入数据，同时追踪最后一条数据的时间戳
@@ -320,7 +363,7 @@ int main(int argc, const char* argv[])
 
     // 退出时 flush 所有通道
     for (auto& ch : channels) {
-        if (ch.current_minute >= 0) {
+        if (ch.current_target_file >= 0) {
             ch.writer.close();
             ch.total_rows += ch.writer.row_count();
         }
