@@ -668,6 +668,7 @@ int main(int argc, const char* argv[]) {
     using SteadyClock = std::chrono::steady_clock;
     auto last_tick_time = SteadyClock::now();
     constexpr int IDLE_TIMEOUT_SEC = 60;
+    int last_market_time = -1;  // 最近一个 tick 的行情时间 (HHMMSSmmm)
 
     while (g_running) {
         FramePtr frame = reader->getNextFrame();
@@ -676,7 +677,9 @@ int main(int argc, const char* argv[]) {
             if (has_data) {
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                     SteadyClock::now() - last_tick_time).count();
-                if (elapsed >= IDLE_TIMEOUT_SEC) {
+                // 午休时段 (11:29~13:01) 不触发 idle 退出
+                bool in_lunch_break = (last_market_time >= 112900000 && last_market_time <= 130100000);
+                if (elapsed >= IDLE_TIMEOUT_SEC && !in_lunch_break) {
                     std::cout << "[idle] " << elapsed << "s no data, finalizing and exiting..." << std::endl;
                     do_finalize();
                     std::cout << "\n[done] total ticks: " << tick_count << std::endl;
@@ -702,6 +705,7 @@ int main(int argc, const char* argv[]) {
         }
 
         last_tick_time = SteadyClock::now();
+        last_market_time = md->Time;
         has_data = true;
 
         auto& state = symbols[md->Symbol];
