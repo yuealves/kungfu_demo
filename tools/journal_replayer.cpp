@@ -8,6 +8,7 @@
 
 #include "JournalWriter.h"
 #include "Timer.h"
+#include "replay_support.hpp"
 #include "sys_messages.h"
 
 #include <iostream>
@@ -53,18 +54,6 @@ struct LocalFrameHeader {
     long extra_nano;
     int err_id;
 } __attribute__((packed));
-
-// ---- 回放用数据结构 ----
-
-struct ReplayFrame {
-    long nano;
-    short msg_type;
-    short source;
-    unsigned char last_flag;
-    int req_id;
-    void* data;
-    int data_len;
-};
 
 // mmap 页面持有者，保持 mmap 映射在整个回放过程中有效
 class MmapPage {
@@ -113,9 +102,16 @@ static void signal_handler(int) { g_running = false; }
 
 int main(int argc, const char* argv[])
 {
-    double speed = 1.0;
-    if (argc > 1) speed = std::atof(argv[1]);
-    if (speed <= 0) speed = 1.0;
+    ReplayOptions opts;
+    try {
+        opts = parseReplayOptions(argc, argv);
+    } catch (const std::exception& ex) {
+        std::cerr << "[args] " << ex.what() << std::endl;
+        std::cerr << "Usage: ./journal_replayer [--source journal|parquet] [--date-dir PATH] [speed]" << std::endl;
+        return 1;
+    }
+
+    double speed = opts.speed;
 
     std::string src_path = std::string(PROJECT_ROOT_DIR) + "/deps/data/";
     std::string dst_dir = "/shared/kungfu/journal/user/";
@@ -158,46 +154,57 @@ int main(int argc, const char* argv[])
     long skipped_frames = 0;
     int skipped_pages = 0;
 
-    for (auto& ch_name : channel_names) {
-        auto files = findJournalFiles(src_path, ch_name);
-        std::cout << "[load] " << ch_name << ": " << files.size() << " files" << std::endl;
+    if (opts.source == "parquet") {
+        std::cout << "[source] parquet: " << opts.date_dir << std::endl;
+        frames = loadParquetFrames(opts.date_dir, resume_nano);
+    } else {
+        std::cout << "[source] journal: " << src_path << std::endl;
+        for (auto& ch_name : channel_names) {
+            auto files = findJournalFiles(src_path, ch_name);
+            std::cout << "[load] " << ch_name << ": " << files.size() << " files" << std::endl;
 
-        for (auto& filepath : files) {
-            MmapPage page;
-            if (!page.load(filepath)) {
-                std::cerr << "[load] failed: " << filepath << std::endl;
-                continue;
-            }
-
-            // 利用 PageHeader 的 close_nano 整页跳过
-            auto* ph = (LocalPageHeader*)page.buffer;
-            if (resume_nano > 0 && ph->close_nano > 0 && ph->close_nano <= resume_nano) {
-                skipped_pages++;
-                continue;  // 整个 page 的数据都已写入，跳过
-            }
-
-            bool page_needed = false;
-            size_t pos = sizeof(LocalPageHeader);
-            while (pos + sizeof(LocalFrameHeader) <= page.size) {
-                auto* hdr = (LocalFrameHeader*)((char*)page.buffer + pos);
-                if (hdr->status != JOURNAL_FRAME_STATUS_WRITTEN) break;
-                if (hdr->length <= (int)sizeof(LocalFrameHeader) || pos + hdr->length > page.size) break;
-
-                if (hdr->nano <= resume_nano) {
-                    skipped_frames++;
-                } else {
-                    int data_len = hdr->length - sizeof(LocalFrameHeader);
-                    void* data = (char*)hdr + sizeof(LocalFrameHeader);
-                    frames.push_back({hdr->nano, hdr->msg_type, hdr->source,
-                                      hdr->last_flag, hdr->req_id, data, data_len});
-                    page_needed = true;
+            for (auto& filepath : files) {
+                MmapPage page;
+                if (!page.load(filepath)) {
+                    std::cerr << "[load] failed: " << filepath << std::endl;
+                    continue;
                 }
-                pos += hdr->length;
-            }
 
-            if (page_needed)
-                pages.push_back(std::move(page));
-            // 不需要的 page 出作用域自动 munmap
+                auto* ph = (LocalPageHeader*)page.buffer;
+                if (resume_nano > 0 && ph->close_nano > 0 && ph->close_nano <= resume_nano) {
+                    skipped_pages++;
+                    continue;
+                }
+
+                bool page_needed = false;
+                size_t pos = sizeof(LocalPageHeader);
+                while (pos + sizeof(LocalFrameHeader) <= page.size) {
+                    auto* hdr = (LocalFrameHeader*)((char*)page.buffer + pos);
+                    if (hdr->status != JOURNAL_FRAME_STATUS_WRITTEN) break;
+                    if (hdr->length <= (int)sizeof(LocalFrameHeader) || pos + hdr->length > page.size) break;
+
+                    if (hdr->nano <= resume_nano) {
+                        skipped_frames++;
+                    } else {
+                        int data_len = hdr->length - sizeof(LocalFrameHeader);
+                        void* data = (char*)hdr + sizeof(LocalFrameHeader);
+                        ReplayFrame frame;
+                        frame.nano = hdr->nano;
+                        frame.msg_type = hdr->msg_type;
+                        frame.source = hdr->source;
+                        frame.last_flag = hdr->last_flag;
+                        frame.req_id = hdr->req_id;
+                        frame.data = data;
+                        frame.data_len = data_len;
+                        frames.push_back(frame);
+                        page_needed = true;
+                    }
+                    pos += hdr->length;
+                }
+
+                if (page_needed)
+                    pages.push_back(std::move(page));
+            }
         }
     }
 

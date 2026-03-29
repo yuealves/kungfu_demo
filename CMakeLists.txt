@@ -46,6 +46,9 @@ FIND_PACKAGE(PythonLibs 2)
 INCLUDE_DIRECTORIES(${PYTHON_INCLUDE_PATH})
 link_directories(${PYTHON_LIBRARIES})
 
+find_package(Arrow REQUIRED)
+find_package(Parquet REQUIRED)
+
 # 将项目根路径注入编译宏，代码中可用 PROJECT_ROOT_DIR 拼接相对路径
 add_definitions(-DPROJECT_ROOT_DIR="${PROJECT_SOURCE_DIR}")
 
@@ -79,8 +82,12 @@ ADD_EXECUTABLE(data_consumer src/data_consumer.cpp)
 
 TARGET_LINK_LIBRARIES(data_consumer insight_handle)
 
-ADD_EXECUTABLE(journal_replayer tools/journal_replayer.cpp)
-TARGET_LINK_LIBRARIES(journal_replayer insight_handle)
+ADD_EXECUTABLE(journal_replayer tools/journal_replayer.cpp tools/replay_support.cpp)
+TARGET_LINK_LIBRARIES(journal_replayer insight_handle Arrow::arrow_shared Parquet::parquet_shared)
+
+ADD_EXECUTABLE(replay_parquet_test tests/replay_parquet_test.cpp tools/replay_support.cpp)
+target_include_directories(replay_parquet_test PRIVATE tools)
+TARGET_LINK_LIBRARIES(replay_parquet_test insight_handle Arrow::arrow_shared Parquet::parquet_shared)
 
 ADD_EXECUTABLE(live_reader tools/live_reader.cpp)
 TARGET_LINK_LIBRARIES(live_reader insight_handle)
@@ -94,4 +101,3 @@ ADD_EXECUTABLE(verify_nanotime tests/verify_nanotime.cpp)
 TARGET_LINK_LIBRARIES(verify_nanotime dl)
 # verify_nanotime 通过 dlopen 加载 libjournal.so，清除 RPATH 让 LD_LIBRARY_PATH 生效
 set_target_properties(verify_nanotime PROPERTIES SKIP_BUILD_RPATH TRUE)
-

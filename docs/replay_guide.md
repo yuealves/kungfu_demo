@@ -6,13 +6,13 @@
 
 - Docker 容器环境（KungFu v1.0.0 已安装）
 - `build/journal_replayer` 已编译（`cd build && cmake .. && make journal_replayer`）
-- `deps/data/` 下有历史 journal 数据
+- `deps/data/` 下有历史 journal 数据，或某个交易日目录下有 archive 输出的 parquet 分片
 
 ## 命令一览
 
 | 命令 | 说明 |
 |------|------|
-| `./scripts/replay start [--reset] [speed]` | 启动 Paged + replayer 后台运行 |
+| `./scripts/replay start [--reset] [--source journal|parquet] [--date-dir PATH] [speed]` | 启动 Paged + replayer 后台运行 |
 | `./scripts/replay stop` | 停止 replayer（保留 Paged） |
 | `./scripts/replay status` | 查看 Paged 和 replayer 运行状态 |
 | `./scripts/replay clean` | 停止所有服务 + 清理 journal 文件 |
@@ -62,6 +62,20 @@ replayer 通过扫描目标 journal 的 `extra_nano` 字段自动跳过已写入
 
 `--reset` 会在启动前删除 `/shared/kungfu/journal/user/yjj.insight_stock_*`，使 replayer 从第一帧开始写入。
 
+### 从 parquet 日期目录回放
+
+```bash
+./scripts/replay start --source parquet --date-dir /data/dump_parquet/2026-03-26 10
+./scripts/replay start --reset --source parquet --date-dir /data/dump_parquet/2026-03-26 10
+```
+
+说明：
+
+- `--source parquet`：切换为 parquet 数据源模式
+- `--date-dir`：指定 parquet 所在目录。既可以是某个交易日目录，也可以直接是放置这批 parquet 文件的目录；目录内应包含 `*_tick_data_*.parquet`、`*_order_data_*.parquet`、`*_trade_data_*.parquet`
+- parquet 回放时使用 `nano_timestamp` 作为原始时间轴，并写入目标 journal 的 `extra_nano`
+- 因此下游仍应优先读取 `extra_nano`，其语义与现有 journal replay 完全一致
+
 ### 完全清理
 
 ```bash
@@ -72,22 +86,25 @@ replayer 通过扫描目标 journal 的 `extra_nano` 字段自动跳过已写入
 
 ## 各命令详解
 
-### `replay start [--reset] [speed]`
+### `replay start [--reset] [--source journal|parquet] [--date-dir PATH] [speed]`
 
 1. 检查 replayer 是否已在运行，是则报错退出（避免重复启动）
 2. 检查 Paged 是否运行，未运行则调用 `start_paged.sh` 启动
 3. 若指定 `--reset`，删除目标 journal 文件
-4. 以 `nohup` 后台启动 `journal_replayer`，PID 写入 `build/replayer.pid`，日志输出到 `build/replayer.log`
+4. 按参数选择 journal 或 parquet 数据源，以 `nohup` 后台启动 `journal_replayer`，PID 写入 `build/replayer.pid`，日志输出到 `build/replayer.log`
 
 参数：
 - `--reset`：可选，从头开始回放
+- `--source`：可选，`journal` 或 `parquet`，默认 `journal`
+- `--date-dir`：`--source parquet` 时必填，指定 parquet 日期目录
 - `speed`：可选，回放倍速，默认 1（实时速度）
 
 输出示例：
 ```
 [replay] Paged already running (pid=12345)
 [replay] resuming from last position (use --reset to start over)
-[replay] replayer started (pid=12350, speed=10x)
+[replay] replayer started (pid=12350, source=parquet, speed=10x)
+[replay] parquet dir: /data/dump_parquet/2026-03-26
 [replay] log: /workspace/.../build/replayer.log
 ```
 
@@ -167,4 +184,11 @@ frame.setNano(nano);
 ./scripts/replay clean
 # 替换 deps/data/ 下的 journal 文件
 ./scripts/replay start 10
+```
+
+如果是 parquet：
+
+```bash
+./scripts/replay clean
+./scripts/replay start --source parquet --date-dir /new/date/dir 10
 ```

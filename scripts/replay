@@ -2,7 +2,7 @@
 # scripts/replay — replayer + Paged 生命周期管理
 #
 # 用法:
-#   replay start [--reset] [speed]   启动 Paged + replayer 后台运行
+#   replay start [--reset] [--source journal|parquet] [--date-dir PATH] [speed]   启动 Paged + replayer 后台运行
 #   replay stop                      停止 replayer（保留 Paged）
 #   replay status                    显示 Paged 和 replayer 运行状态
 #   replay clean                     停止 replayer + Paged + 清理所有残留
@@ -66,15 +66,24 @@ ensure_paged() {
 
 cmd_start() {
     local reset=0
+    local source="journal"
+    local date_dir=""
     local speed=1
 
     # parse args
     while [ $# -gt 0 ]; do
         case "$1" in
             --reset) reset=1; shift ;;
+            --source) source="$2"; shift 2 ;;
+            --date-dir) date_dir="$2"; shift 2 ;;
             *)       speed="$1"; shift ;;
         esac
     done
+
+    if [ "$source" = "parquet" ] && [ -z "$date_dir" ]; then
+        echo "[replay] ERROR: --date-dir is required when --source parquet"
+        exit 1
+    fi
 
     # check if already running
     if is_replayer_running; then
@@ -106,10 +115,17 @@ cmd_start() {
     # launch replayer in background
     export LD_LIBRARY_PATH=/opt/kungfu/master/lib/yijinjing:/opt/kungfu/master/lib/boost:$PROJECT_DIR/lib
     cd "$BUILD_DIR"
-    nohup ./journal_replayer "$speed" > "$LOG_FILE" 2>&1 &
+    if [ "$source" = "parquet" ]; then
+        nohup ./journal_replayer --source parquet --date-dir "$date_dir" "$speed" > "$LOG_FILE" 2>&1 &
+    else
+        nohup ./journal_replayer "$speed" > "$LOG_FILE" 2>&1 &
+    fi
     echo $! > "$PID_FILE"
 
-    echo "[replay] replayer started (pid=$(cat "$PID_FILE"), speed=${speed}x)"
+    echo "[replay] replayer started (pid=$(cat "$PID_FILE"), source=${source}, speed=${speed}x)"
+    if [ "$source" = "parquet" ]; then
+        echo "[replay] parquet dir: $date_dir"
+    fi
     echo "[replay] log: $LOG_FILE"
 }
 
@@ -167,7 +183,7 @@ case "${1:-}" in
         echo "Usage: replay {start|stop|status|clean}"
         echo ""
         echo "Commands:"
-        echo "  start [--reset] [speed]  Start Paged + replayer (default speed=1)"
+        echo "  start [--reset] [--source journal|parquet] [--date-dir PATH] [speed]"
         echo "  stop                     Stop replayer (keep Paged running)"
         echo "  status                   Show Paged and replayer status"
         echo "  clean                    Stop everything + clean journals"
