@@ -75,6 +75,8 @@ replayer 通过扫描目标 journal 的 `extra_nano` 字段自动跳过已写入
 - `--date-dir`：指定 parquet 所在目录。既可以是某个交易日目录，也可以直接是放置这批 parquet 文件的目录；目录内应包含 `*_tick_data_*.parquet`、`*_order_data_*.parquet`、`*_trade_data_*.parquet`
 - parquet 回放时使用 `nano_timestamp` 作为原始时间轴，并写入目标 journal 的 `extra_nano`
 - 因此下游仍应优先读取 `extra_nano`，其语义与现有 journal replay 完全一致
+- parquet 模式会先同步打开每个频道的首个可用文件，然后后台线程继续预取后续文件，因此通常会比一次性全量加载更早看到 `[replay] starting`
+- 回放期间会持续打印文件进度日志，例如 `[parquet] tick files: N`、`[parquet] open tick file 1/N: ...`、`[parquet] finish tick file 1/N`
 
 ### 完全清理
 
@@ -93,6 +95,11 @@ replayer 通过扫描目标 journal 的 `extra_nano` 字段自动跳过已写入
 3. 若指定 `--reset`，删除目标 journal 文件
 4. 按参数选择 journal 或 parquet 数据源，以 `nohup` 后台启动 `journal_replayer`，PID 写入 `build/replayer.pid`，日志输出到 `build/replayer.log`
 
+其中 parquet 模式的启动行为是：
+- 先统计 tick/order/trade 三类 parquet 文件数量
+- 每个频道同步加载首个可回放文件，满足后立即进入 replay 主循环
+- 后续 parquet 分片由后台预取，当前文件读完时继续打印 `finish/open` 日志并切换到下一文件
+
 参数：
 - `--reset`：可选，从头开始回放
 - `--source`：可选，`journal` 或 `parquet`，默认 `journal`
@@ -106,6 +113,11 @@ replayer 通过扫描目标 journal 的 `extra_nano` 字段自动跳过已写入
 [replay] replayer started (pid=12350, source=parquet, speed=10x)
 [replay] parquet dir: /data/dump_parquet/2026-03-26
 [replay] log: /workspace/.../build/replayer.log
+[parquet] tick files: 120
+[parquet] open tick file 1/120: /data/dump_parquet/2026-03-26/20260326_tick_data_001.parquet
+[replay] starting (09:30:00)...
+[parquet] finish tick file 1/120
+[parquet] open tick file 2/120: /data/dump_parquet/2026-03-26/20260326_tick_data_002.parquet
 ```
 
 ### `replay stop`

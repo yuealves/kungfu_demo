@@ -151,12 +151,13 @@ int main(int argc, const char* argv[])
     // ---- Step 2: 加载源数据，跳过 nano <= resume_nano 的帧 ----
     std::vector<MmapPage> pages;
     std::vector<ReplayFrame> frames;
+    std::unique_ptr<ParquetReplayStream> parquet_stream;
     long skipped_frames = 0;
     int skipped_pages = 0;
 
     if (opts.source == "parquet") {
         std::cout << "[source] parquet: " << opts.date_dir << std::endl;
-        frames = loadParquetFrames(opts.date_dir, resume_nano);
+        parquet_stream.reset(new ParquetReplayStream(opts.date_dir, resume_nano));
     } else {
         std::cout << "[source] journal: " << src_path << std::endl;
         for (auto& ch_name : channel_names) {
@@ -213,21 +214,34 @@ int main(int argc, const char* argv[])
                   << skipped_frames << " frames" << std::endl;
     }
 
-    std::cout << "[load] frames to replay: " << frames.size() << std::endl;
-    if (frames.empty()) {
-        std::cout << "[done] all frames already written, nothing to replay" << std::endl;
-        return 0;
+    long first_nano = 0;
+    std::size_t total_frames = 0;
+    if (opts.source == "parquet") {
+        if (!parquet_stream->hasNext()) {
+            std::cout << "[done] all frames already written, nothing to replay" << std::endl;
+            return 0;
+        }
+        first_nano = parquet_stream->firstNano();
+    } else {
+        std::cout << "[load] frames to replay: " << frames.size() << std::endl;
+        if (frames.empty()) {
+            std::cout << "[done] all frames already written, nothing to replay" << std::endl;
+            return 0;
+        }
+
+        // ---- Step 3: 按 nano 时间排序（合并 3 个频道） ----
+        std::sort(frames.begin(), frames.end(),
+                  [](const ReplayFrame& a, const ReplayFrame& b) { return a.nano < b.nano; });
+
+        first_nano = frames.front().nano;
+        total_frames = frames.size();
+        std::cout << "[time] "
+                  << kungfu::yijinjing::parseNano(frames.front().nano, "%Y%m%d-%H:%M:%S")
+                  << " -> "
+                  << kungfu::yijinjing::parseNano(frames.back().nano, "%Y%m%d-%H:%M:%S")
+                  << std::endl;
     }
 
-    // ---- Step 3: 按 nano 时间排序（合并 3 个频道） ----
-    std::sort(frames.begin(), frames.end(),
-              [](const ReplayFrame& a, const ReplayFrame& b) { return a.nano < b.nano; });
-
-    std::cout << "[time] "
-              << kungfu::yijinjing::parseNano(frames.front().nano, "%Y%m%d-%H:%M:%S")
-              << " -> "
-              << kungfu::yijinjing::parseNano(frames.back().nano, "%Y%m%d-%H:%M:%S")
-              << std::endl;
     std::cout << "[speed] " << speed << "x" << std::endl;
 
     // ---- Step 4: 创建 3 个 JournalWriter（通过 Paged） ----
@@ -251,30 +265,44 @@ int main(int argc, const char* argv[])
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    long first_nano = frames[0].nano;
     auto wall_start = std::chrono::steady_clock::now();
     long count = 0;
     long skipped = 0;
 
     std::cout << "[replay] starting (" << parseNano(first_nano, "%H:%M:%S") << ")..." << std::endl;
 
-    for (auto& f : frames) {
-        if (!g_running) break;
-
-        // 按倍速 sleep 到目标时刻
+    auto replay_one = [&](const ReplayFrame& f) {
         long delta_nano = f.nano - first_nano;
         auto target = wall_start + std::chrono::nanoseconds(static_cast<long long>(delta_nano / speed));
         std::this_thread::sleep_until(target);
 
         int idx = writerIndex(f.msg_type);
-        if (idx < 0) { skipped++; continue; }
+        if (idx < 0) {
+            skipped++;
+            return;
+        }
 
         writers[idx]->write_frame_extra(f.data, f.data_len, f.source, f.msg_type, f.last_flag, f.req_id, f.nano);
         count++;
 
         if (count % 100000 == 0) {
-            std::cout << "[replay] " << count << "/" << frames.size()
-                      << " | time: " << parseNano(f.nano, "%H:%M:%S") << std::endl;
+            std::cout << "[replay] " << count;
+            if (opts.source == "journal") {
+                std::cout << "/" << total_frames;
+            }
+            std::cout << " | time: " << parseNano(f.nano, "%H:%M:%S") << std::endl;
+        }
+    };
+
+    if (opts.source == "parquet") {
+        while (g_running && parquet_stream->hasNext()) {
+            ReplayFrame f = parquet_stream->popNext();
+            replay_one(f);
+        }
+    } else {
+        for (auto& f : frames) {
+            if (!g_running) break;
+            replay_one(f);
         }
     }
 

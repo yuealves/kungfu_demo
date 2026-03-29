@@ -23,11 +23,27 @@ struct ReplayFrame {
     int data_len = 0;
 };
 
+class ParquetReplayStream {
+public:
+    ParquetReplayStream(const std::string& date_dir, long resume_nano);
+    ~ParquetReplayStream();
+    bool hasNext() const;
+    long firstNano() const;
+    ReplayFrame popNext();
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 ReplayOptions parseReplayOptions(int argc, const char* argv[]);
 ReplayOptions parseReplayOptionsForTest(const std::vector<std::string>& args);
 
 std::vector<ReplayFrame> loadParquetFrames(const std::string& date_dir, long resume_nano);
 std::vector<ReplayFrame> loadParquetFramesForTest(const std::string& date_dir, long resume_nano);
 std::string createTestParquetDirForTest();
+std::string createMultiFileParquetDirForTest();
+std::string createSplitTickParquetDirForTest();
+std::string createPoisonParquetDirForTest();
 
 std::vector<long> build_test_parquet_replay_nanos();
